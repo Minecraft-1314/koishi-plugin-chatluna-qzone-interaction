@@ -1,0 +1,18 @@
+node_modules/
+lib/
+dist/
+temp/
+*.tsbuildinfo
+
+.codegraph/
+
+.DS_Store
+Thumbs.db
+
+# agents
+.agents
+.codex
+.claude
+
+# codegraph
+.codegraph

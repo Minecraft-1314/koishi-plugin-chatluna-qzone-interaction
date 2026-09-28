@@ -1,0 +1,215 @@
+import type { Context } from 'koishi'
+import type { Config } from '../config'
+import type { LivingDiaryLogger } from '../logging'
+import { publishQzonePost } from '../publish'
+import {
+    registerGetTempListener,
+    subscribeAssistantResponses,
+    type TempLike
+} from './character-runtime'
+import { parseSelfClosingXmlTags } from './self-closing'
+
+export const PUBLISH_TAG = 'qzone_publish'
+const MAX_TAGS_PER_RESPONSE = 3
+
+interface CharacterServiceLike {
+    getTemp?: (...args: unknown[]) => Promise<TempLike>
+}
+
+interface PipelineHandler {
+    (runtime: unknown, next: () => Promise<void>): Promise<void>
+}
+
+interface ContextManagerLike {
+    pipeline?: (
+        stage: string,
+        handler: PipelineHandler,
+        priority?: number
+    ) => () => void
+}
+
+interface ToolStats {
+    observed: number
+    published: number
+    failed: number
+}
+
+const readCharacterService = (
+    ctx: Context
+): CharacterServiceLike | null => {
+    const holder = ctx as unknown as Record<string, unknown>
+    const service = holder['chatluna_character']
+    if (service == null) return null
+    const candidate = service as CharacterServiceLike
+    return typeof candidate.getTemp === 'function' ? candidate : null
+}
+
+const imageIndex = (key: string): number =>
+    Number.parseInt(key.replace(/^image/iu, ''), 10) || 0
+
+const errorText = (error: unknown): string =>
+    error instanceof Error ? error.message : String(error)
+
+export class PublishXmlTool {
+    #dispose: (() => void) | null = null
+    #promptDispose: (() => void) | null = null
+    #warned = false
+    #stats: ToolStats = { observed: 0, published: 0, failed: 0 }
+
+    constructor(
+        private readonly ctx: Context,
+        private readonly config: Config,
+        private readonly logger: LivingDiaryLogger
+    ) {}
+
+    get stats(): ToolStats {
+        return this.#stats
+    }
+
+    start(): void {
+        if (!this.config.enablePublishTool) {
+            this.logger.debug('qzone_publish XML 发布能力未启用')
+            return
+        }
+        const service = readCharacterService(this.ctx)
+        if (service === null) {
+            this.#warnMissingCharacter()
+            return
+        }
+        const sessions = new WeakMap<object, unknown>()
+        const unsubscribes = new WeakMap<object, () => void>()
+        const detach = registerGetTempListener(
+            service as unknown as Record<string, unknown>,
+            (temp, session) => {
+                const list = temp?.completionMessages
+                if (!Array.isArray(list) || list.length === 0) return
+                const key = list as unknown as object
+                sessions.set(key, session)
+                if (unsubscribes.has(key)) return
+                const unsubscribe = subscribeAssistantResponses(
+                    list,
+                    () => sessions.get(key) ?? null,
+                    (payload) => this.#onResponse(payload.response),
+                    (error) => {
+                        this.logger.warn(
+                            '[qzone_publish] 处理模型输出失败：' +
+                                errorText(error)
+                        )
+                    }
+                )
+                unsubscribes.set(key, unsubscribe)
+            },
+            (args) => args[0] ?? null
+        )
+        if (detach === null) {
+            this.#warnMissingCharacter()
+            return
+        }
+        this.#dispose = detach
+        this.#promptDispose = this.#injectPrompt()
+        this.logger.info('qzone_publish XML 发布能力已挂载（Character 流程）')
+    }
+
+    stop(): void {
+        this.#dispose?.()
+        this.#dispose = null
+        this.#promptDispose?.()
+        this.#promptDispose = null
+    }
+
+    #warnMissingCharacter(): void {
+        if (this.#warned) return
+        this.#warned = true
+        this.logger.warn(
+            'qzone_publish XML 发布能力挂起：未检测到可用的 chatluna_character 服务'
+        )
+    }
+
+    #onResponse(response: string): void {
+        const tags = parseSelfClosingXmlTags(response, PUBLISH_TAG)
+        if (tags.length === 0) return
+        this.#stats.observed += tags.length
+        if (this.config.debug) {
+            this.logger.info(
+                '[qzone_publish] 捕获 ' +
+                    tags.length +
+                    ' 个 <' +
+                    PUBLISH_TAG +
+                    '> 标签'
+            )
+        }
+        for (const attrs of tags.slice(0, MAX_TAGS_PER_RESPONSE)) {
+            void this.#publishOne(attrs)
+        }
+    }
+
+    async #publishOne(attrs: Record<string, string>): Promise<void> {
+        const content = (attrs['content'] ?? '').trim()
+        if (content.length === 0) {
+            this.logger.warn('qzone_publish：标签缺少 content 属性，已忽略')
+            return
+        }
+        const imageUrls = Object.keys(attrs)
+            .filter((key) => /^image\d+$/u.test(key))
+            .sort((left, right) => imageIndex(left) - imageIndex(right))
+            .map((key) => attrs[key].trim())
+            .filter((url) => url.length > 0)
+        try {
+            const result = await publishQzonePost(this.ctx, {
+                content,
+                imageUrls,
+                debug: this.config.debug
+            })
+            this.#stats[result.ok ? 'published' : 'failed'] += 1
+            const text = '[qzone_publish] ' + result.text
+            this.logger[result.ok ? 'info' : 'warn'](text)
+        } catch (error) {
+            this.#stats.failed += 1
+            this.logger.warn('[qzone_publish] 发布异常 ' + errorText(error))
+        }
+    }
+
+    #injectPrompt(): (() => void) | null {
+        const template = this.config.promptPublishTool.trim()
+        if (template.length === 0) return null
+        const holder = this.ctx as unknown as Record<string, unknown>
+        const chatluna = holder['chatluna'] as
+            | { contextManager?: ContextManagerLike }
+            | undefined
+        const manager = chatluna?.contextManager
+        if (typeof manager?.pipeline !== 'function') {
+            this.logger.warn(
+                '当前 ChatLuna 版本不支持自动注入参考提示词，请把配置项 ' +
+                    'promptPublishTool 的内容手动加入 Character 预设提示词，' +
+                    '否则模型不会输出 <' +
+                    PUBLISH_TAG +
+                    '> 标签'
+            )
+            return null
+        }
+        return manager.pipeline(
+            'after_system_prompts',
+            async (runtime, next) => {
+                await this.#pushSystemPrompt(runtime, template)
+                await next()
+            },
+            30
+        )
+    }
+
+    async #pushSystemPrompt(
+        runtime: unknown,
+        template: string
+    ): Promise<void> {
+        try {
+            const messages = (runtime as { result?: unknown[] })?.result
+            if (!Array.isArray(messages)) return
+            const { SystemMessage } = await import('@langchain/core/messages')
+            messages.push(new SystemMessage(template))
+        } catch (error) {
+            this.logger.debug(
+                '[qzone_publish] 注入参考提示词失败：' + errorText(error)
+            )
+        }
+    }
+}

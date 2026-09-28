@@ -1,0 +1,120 @@
+{
+  "name": "koishi-plugin-chatluna-qzone-interaction",
+  "description": "koishi-plugin-chatluna-livingdiary 的分支（fork），全部走纯 XML 文本契约，完全不使用模型工具调用能力",
+  "version": "0.0.1",
+  "main": "lib/index.js",
+  "typings": "lib/index.d.ts",
+  "files": ["lib", "docs"],
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc -w",
+    "clean": "rimraf lib"
+  },
+  "keywords": [
+    "chatbot",
+    "koishi",
+    "plugin",
+    "chatluna",
+    "chatluna-plugin",
+    "qzone",
+    "xml",
+    "command",
+    "指令",
+    "multimodal",
+    "image",
+    "vision",
+    "comment",
+    "reply",
+    "like",
+    "digest",
+    "publish",
+    "onebot",
+    "milky",
+    "whitelist",
+    "qq空间",
+    "空间动态",
+    "自动评论",
+    "自动回复",
+    "点赞",
+    "每日记忆",
+    "日记",
+    "定时发布",
+    "白名单",
+    "提示词可编辑",
+    "文本契约",
+    "无需工具调用",
+    "多模态",
+    "定时轮询",
+    "调试模式"
+  ],
+  "dependencies": {
+    "@langchain/core": "^0.3.80",
+    "@vue/reactivity": "^3.6.0-alpha.2",
+    "qzone-sdk": "^0.3.3",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "koishi": "^4.18.9",
+    "koishi-plugin-adapter-onebot": "6.9.4",
+    "koishi-plugin-chatluna": "^1.4.0-alpha.37",
+    "koishi-plugin-chatluna-storage-service": "^1.0.7",
+    "rimraf": "^5.0.5",
+    "typescript": "^5.9.3"
+  },
+  "peerDependencies": {
+    "koishi": "^4.18.9",
+    "koishi-plugin-chatluna": "^1.4.0-alpha.37",
+    "koishi-plugin-chatluna-character": "^0.0.234",
+    "koishi-plugin-chatluna-memory": ">=0.0.1",
+    "koishi-plugin-chatluna-livingmemory": ">=0.24.0",
+    "koishi-plugin-chatluna-storage-service": ">=1.0.7",
+    "koishi-plugin-chatluna-multimodal-service": ">=1.4.0-alpha.6"
+  },
+  "peerDependenciesMeta": {
+    "koishi-plugin-chatluna-character": {
+      "optional": true
+    },
+    "koishi-plugin-chatluna-memory": {
+      "optional": true
+    },
+    "koishi-plugin-chatluna-livingmemory": {
+      "optional": true
+    },
+    "koishi-plugin-chatluna-storage-service": {
+      "optional": true
+    },
+    "koishi-plugin-chatluna-multimodal-service": {
+      "optional": true
+    }
+  },
+  "koishi": {
+    "description": {
+      "zh": "koishi-plugin-chatluna-livingdiary 的分支，全部走纯 XML 文本契约，完全不使用模型工具调用能力",
+      "en": "A fork of koishi-plugin-chatluna-livingdiary restoring Qzone auto-interaction, all driven by pure XML text contracts with no model tool calling"
+    },
+    "service": {
+      "required": [
+        "chatluna"
+      ],
+      "optional": [
+        "chatluna_character",
+        "chatluna_memory",
+        "chatluna_living_memory",
+        "chatluna_storage"
+      ]
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Minecraft-1314/koishi-plugin-chatluna-qzone-interaction.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Minecraft-1314/koishi-plugin-chatluna-qzone-interaction/issues"
+  },
+  "homepage": "https://github.com/Minecraft-1314/koishi-plugin-chatluna-qzone-interaction#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
