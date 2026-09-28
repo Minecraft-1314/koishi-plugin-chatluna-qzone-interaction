@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-chatluna-qzone-interaction",
   "description": "koishi-plugin-chatluna-livingdiary 的分支（fork），全部走纯 XML 文本契约，完全不使用模型工具调用能力",
-  "version": "0.0.2",
+  "version": "0.0.4",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": ["lib", "docs"],
@@ -9,7 +9,8 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc -w",
-    "clean": "rimraf lib"
+    "clean": "rimraf lib",
+    "test": "node test/units.js && node test/runtime.js && node test/commands.js"
   },
   "keywords": [
     "chatbot",

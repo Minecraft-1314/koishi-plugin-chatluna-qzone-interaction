@@ -11,6 +11,8 @@ import { parseSelfClosingXmlTags } from './self-closing'
 
 export const PUBLISH_TAG = 'qzone_publish'
 const MAX_TAGS_PER_RESPONSE = 3
+const PUBLISH_RETRY_DELAY_MS = 1000
+const PUBLISH_MAX_RETRIES = 3
 
 interface CharacterServiceLike {
     getTemp?: (...args: unknown[]) => Promise<TempLike>
@@ -53,8 +55,12 @@ const errorText = (error: unknown): string =>
 export class PublishXmlTool {
     #dispose: (() => void) | null = null
     #promptDispose: (() => void) | null = null
+    #sessionDisposes: (() => void)[] = []
     #warned = false
     #stats: ToolStats = { observed: 0, published: 0, failed: 0 }
+    #publishQueue: Array<{ attrs: Record<string, string>; retries: number }> = []
+    #publishing = false
+    #generation = 0
 
     constructor(
         private readonly ctx: Context,
@@ -78,11 +84,13 @@ export class PublishXmlTool {
         }
         const sessions = new WeakMap<object, unknown>()
         const unsubscribes = new WeakMap<object, () => void>()
+        this.#sessionDisposes = []
+        this.#generation += 1
         const detach = registerGetTempListener(
             service as unknown as Record<string, unknown>,
             (temp, session) => {
                 const list = temp?.completionMessages
-                if (!Array.isArray(list) || list.length === 0) return
+                if (!Array.isArray(list)) return
                 const key = list as unknown as object
                 sessions.set(key, session)
                 if (unsubscribes.has(key)) return
@@ -98,6 +106,7 @@ export class PublishXmlTool {
                     }
                 )
                 unsubscribes.set(key, unsubscribe)
+                this.#sessionDisposes.push(unsubscribe)
             },
             (args) => args[0] ?? null
         )
@@ -115,6 +124,11 @@ export class PublishXmlTool {
         this.#dispose = null
         this.#promptDispose?.()
         this.#promptDispose = null
+        for (const dispose of this.#sessionDisposes) dispose()
+        this.#sessionDisposes = []
+        this.#generation += 1
+        this.#publishQueue = []
+        this.#publishing = false
     }
 
     #warnMissingCharacter(): void {
@@ -139,11 +153,38 @@ export class PublishXmlTool {
             )
         }
         for (const attrs of tags.slice(0, MAX_TAGS_PER_RESPONSE)) {
-            void this.#publishOne(attrs)
+            this.#publishQueue.push({ attrs, retries: 0 })
+        }
+        void this.#processQueue()
+    }
+
+    async #processQueue(): Promise<void> {
+        if (this.#publishing) return
+        this.#publishing = true
+        const generation = this.#generation
+        try {
+            while (this.#publishQueue.length > 0) {
+                if (generation !== this.#generation) return
+                const item = this.#publishQueue.shift()
+                if (!item) break
+                await this.#publishOneWithRetry(item.attrs, item.retries)
+            }
+        } catch (error) {
+            if (generation !== this.#generation) return
+            this.#stats.failed += this.#publishQueue.length
+            this.#publishQueue = []
+            this.logger.warn(
+                '[qzone_publish] 发布队列异常中断：' + errorText(error)
+            )
+        } finally {
+            if (generation === this.#generation) this.#publishing = false
         }
     }
 
-    async #publishOne(attrs: Record<string, string>): Promise<void> {
+    async #publishOneWithRetry(
+        attrs: Record<string, string>,
+        currentRetries: number
+    ): Promise<void> {
         const content = (attrs['content'] ?? '').trim()
         if (content.length === 0) {
             this.logger.warn('qzone_publish：标签缺少 content 属性，已忽略')
@@ -160,13 +201,40 @@ export class PublishXmlTool {
                 imageUrls,
                 debug: this.config.debug
             })
-            this.#stats[result.ok ? 'published' : 'failed'] += 1
-            const text = '[qzone_publish] ' + result.text
-            this.logger[result.ok ? 'info' : 'warn'](text)
+            if (result.ok) {
+                this.#stats.published += 1
+                this.logger.info('[qzone_publish] ' + result.text)
+                return
+            }
+            if (result.authExpired && currentRetries < PUBLISH_MAX_RETRIES) {
+                this.logger.warn(
+                    '[qzone_publish] 登录态已刷新，准备重试发布...'
+                )
+                await this.#delay(PUBLISH_RETRY_DELAY_MS)
+                this.#publishQueue.push({ attrs, retries: currentRetries + 1 })
+                return
+            }
+            this.#stats.failed += 1
+            this.logger.warn('[qzone_publish] ' + result.text)
         } catch (error) {
+            if (currentRetries < PUBLISH_MAX_RETRIES) {
+                this.logger.warn(
+                    '[qzone_publish] 发布异常，准备重试：' + errorText(error)
+                )
+                await this.#delay(PUBLISH_RETRY_DELAY_MS)
+                this.#publishQueue.push({ attrs, retries: currentRetries + 1 })
+                return
+            }
             this.#stats.failed += 1
             this.logger.warn('[qzone_publish] 发布异常 ' + errorText(error))
         }
+    }
+
+    #delay(ms: number): Promise<void> {
+        return new Promise((resolve) => {
+            const timer = setTimeout(resolve, ms)
+            timer.unref()
+        })
     }
 
     #injectPrompt(): (() => void) | null {

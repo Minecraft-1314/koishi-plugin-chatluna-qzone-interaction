@@ -3,6 +3,7 @@ import type { ChatLunaChatModel } from '../chatluna'
 import type { Config } from '../config'
 import type { LivingDiaryLogger } from '../logging'
 import { publishQzonePost } from '../publish'
+import { isModelConfigured } from '../persona'
 import {
     buildDigestPrompt,
     generateDigestDecision
@@ -143,11 +144,9 @@ export class DigestRuntime {
                     startedAt
                 )
             }
-            const modelRef = this.config.mainModel.trim()
-            const model =
-                modelRef.length > 0
-                    ? await this.deps.resolveModel(modelRef)
-                    : null
+            const model = isModelConfigured(this.config.mainModel)
+                ? await this.deps.resolveModel(this.config.mainModel.trim())
+                : null
             if (model === null) {
                 return this.#finish(
                     'suspended',

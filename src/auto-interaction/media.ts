@@ -219,29 +219,29 @@ export async function prepareInteractionMedia(
             )
             if (!supportsDirectImageMime(model, downloaded.mime)) {
                 const line = lines.length
-            if (describe !== null) deferred.push({ id, url: media.url, line })
+                if (describe !== null) deferred.push({ id, url: media.url, line })
                 lines.push(
                     `${metadata} actual_mime=${downloaded.mime} ` +
-                        `status=unresolved:${'mime-not-supported-directly'}`
+                        'status=unresolved:mime-not-supported-directly'
                 )
                 continue
             }
             const encodedBytes = base64EncodedSize(downloaded.bytes.byteLength)
             if (encodedBytes > maxImageBytes(downloaded.mime)) {
                 const line = lines.length
-            if (describe !== null) deferred.push({ id, url: media.url, line })
+                if (describe !== null) deferred.push({ id, url: media.url, line })
                 lines.push(
                     `${metadata} actual_mime=${downloaded.mime} ` +
-                        `status=unresolved:${'image-size-limit'}`
+                        'status=unresolved:image-size-limit'
                 )
                 continue
             }
             if (totalBytes + encodedBytes > maxTotalBytes) {
                 const line = lines.length
-            if (describe !== null) deferred.push({ id, url: media.url, line })
+                if (describe !== null) deferred.push({ id, url: media.url, line })
                 lines.push(
                     `${metadata} actual_mime=${downloaded.mime} ` +
-                        `status=unresolved:${'total-size-limit'}`
+                        'status=unresolved:total-size-limit'
                 )
                 continue
             }
@@ -279,7 +279,7 @@ export async function prepareInteractionMedia(
             if (describe !== null) deferred.push({ id, url: media.url, line })
             downloadFailedMedia.push(id)
             lines.push(
-                `${metadata} status=unresolved:${'download-or-format'}`
+                `${metadata} status=unresolved:download-or-format`
             )
         }
     }

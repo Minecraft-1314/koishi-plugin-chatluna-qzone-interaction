@@ -112,7 +112,8 @@ interface PushDispatcher {
     readonly messages: unknown[]
     readonly originalPush: (...items: unknown[]) => number
     readonly patchedPush: (...items: unknown[]) => number
-    readonly listeners: Set<PushListener>
+    readonly subscriptions: Set<PushSubscription>
+    readonly seen: WeakSet<object>
 }
 
 export interface AssistantResponse {
@@ -122,6 +123,11 @@ export interface AssistantResponse {
 }
 
 export type PushListener = (payload: AssistantResponse) => void
+
+interface PushSubscription {
+    readonly notify: PushListener
+    readonly delivered: WeakSet<object>
+}
 
 const dispatcherKey = ns(PUSH_DISPATCHER)
 
@@ -146,65 +152,113 @@ const setDispatcher = (
     })
 }
 
+const notifyOne = (
+    subscription: PushSubscription,
+    item: MessageLike,
+    getSession: () => unknown,
+    onListenerError?: (error: unknown) => void
+): void => {
+    const response = extractAssistantText(item)
+    if (response.length === 0) return
+    try {
+        subscription.notify({
+            response,
+            message: item,
+            session: getSession()
+        })
+    } catch (error) {
+        onListenerError?.(error)
+    }
+}
+
+const isTrackable = (item: unknown): item is object =>
+    typeof item === 'object' && item !== null
+
+const replayExistingMessages = (
+    messages: unknown[],
+    subscription: PushSubscription,
+    dispatcherSeen: WeakSet<object>,
+    getSession: () => unknown,
+    onListenerError?: (error: unknown) => void
+): void => {
+    for (const item of messages) {
+        if (!isAiMessage(item)) continue
+        if (isTrackable(item)) {
+            if (subscription.delivered.has(item)) continue
+            subscription.delivered.add(item)
+            dispatcherSeen.add(item)
+        }
+        notifyOne(subscription, item as MessageLike, getSession, onListenerError)
+    }
+}
+
 export function subscribeAssistantResponses(
     messages: unknown[],
     getSession: () => unknown,
     onResponse: PushListener,
     onListenerError?: (error: unknown) => void
 ): () => void {
-    let dispatcher = getDispatcher(messages)
-    if (dispatcher === null) {
-        const listeners = new Set<PushListener>()
-        const seen = new WeakSet<object>()
-        const originalPush = messages.push
-        const patchedPush = function patchedPush(
-            this: unknown[],
-            ...items: unknown[]
-        ): number {
-            const result = originalPush.apply(this, items)
-            for (const item of items) {
-                if (!isAiMessage(item)) continue
-                if (typeof item === 'object' && item !== null) {
-                    if (seen.has(item)) continue
-                    seen.add(item)
-                }
-                const response = extractAssistantText(item)
-                if (response.length === 0) continue
-                for (const listener of Array.from(listeners)) {
-                    try {
-                        listener({
-                            response,
-                            message: item as MessageLike,
-                            session: getSession()
-                        })
-                    } catch (error) {
-                        onListenerError?.(error)
+    const existing = getDispatcher(messages)
+    const dispatcher: PushDispatcher =
+        existing ??
+        (() => {
+            const subscriptions = new Set<PushSubscription>()
+            const seen = new WeakSet<object>()
+            const originalPush = messages.push
+            const patchedPush = function patchedPush(
+                this: unknown[],
+                ...items: unknown[]
+            ): number {
+                const result = originalPush.apply(this, items)
+                for (const item of items) {
+                    if (!isAiMessage(item)) continue
+                    if (isTrackable(item)) {
+                        if (seen.has(item)) continue
+                        seen.add(item)
+                    }
+                    for (const subscription of Array.from(subscriptions)) {
+                        if (isTrackable(item)) {
+                            if (subscription.delivered.has(item)) continue
+                            subscription.delivered.add(item)
+                        }
+                        notifyOne(subscription, item as MessageLike, getSession, onListenerError)
                     }
                 }
+                return result
             }
-            return result
-        }
-        dispatcher = {
-            messages,
-            originalPush,
-            patchedPush,
-            listeners
-        }
-        Object.defineProperty(messages, 'push', {
-            value: patchedPush,
-            configurable: true,
-            enumerable: false,
-            writable: true
-        })
-        setDispatcher(messages, dispatcher)
+            const created: PushDispatcher = {
+                messages,
+                originalPush,
+                patchedPush,
+                subscriptions,
+                seen
+            }
+            Object.defineProperty(messages, 'push', {
+                value: patchedPush,
+                configurable: true,
+                enumerable: false,
+                writable: true
+            })
+            setDispatcher(messages, created)
+            return created
+        })()
+    const subscription: PushSubscription = {
+        notify: onResponse,
+        delivered: new WeakSet<object>()
     }
-    const listener: PushListener = (payload) => onResponse(payload)
-    dispatcher.listeners.add(listener)
+    dispatcher.subscriptions.add(subscription)
+    replayExistingMessages(
+        messages,
+        subscription,
+        dispatcher.seen,
+        getSession,
+        onListenerError
+    )
     return () => {
         const current = getDispatcher(messages)
         if (current === null) return
-        current.listeners.delete(listener)
-        if (current.listeners.size > 0) return
+        current.subscriptions.delete(subscription)
+        if (current.subscriptions.size > 0) return
         if (current.messages.push === current.patchedPush) {
             current.messages.push = current.originalPush
         }

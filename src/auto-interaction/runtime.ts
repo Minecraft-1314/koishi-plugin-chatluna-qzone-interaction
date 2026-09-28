@@ -30,10 +30,13 @@ import {
     findCommentByKey,
     type FriendFeedWatermark,
     type InteractionRuntimeState,
+    isPostBeforeWatermark,
     isPostAfterWatermark,
     type MonitoredPost,
     type PendingTrigger,
     postKey,
+    pruneTerminalTriggers,
+    raiseFriendFeedWatermark,
     removeMonitoredPost,
     sortPendingTriggers,
     terminalizeTrigger,
@@ -56,6 +59,8 @@ import { type LivingDiaryLogger } from '../logging'
 
 export const FRIEND_FEED_PAGE_LIMIT = 6
 const FEED_PAGE_SIZE = 20
+const MAX_PENDING_LIKES = 200
+const KNOWN_SELF_POST_MINIMUM = 64
 
 
 const postTimestamp = (post: QzonePost, fallback: number): number => {
@@ -81,6 +86,7 @@ export class AutoInteractionRuntime {
     readonly #options: AutoInteractionOptions
     readonly #controller = new AbortController()
     readonly #knownSelfPosts = new Set<string>()
+    readonly #pendingLikes = new Map<string, QzonePost>()
     #friendFeedCursor: string | undefined
     #friendFeedCandidateWatermark: FriendFeedWatermark | null = null
     #botId: string | null = null
@@ -106,6 +112,7 @@ export class AutoInteractionRuntime {
         this.cancel()
         this.state = createInteractionRuntimeState()
         this.#knownSelfPosts.clear()
+        this.#pendingLikes.clear()
         this.#friendFeedCursor = undefined
         this.#friendFeedCandidateWatermark = null
         this.#botId = null
@@ -155,6 +162,9 @@ export class AutoInteractionRuntime {
                 this.#discoverSelfPosts(stats)
             )
             await this.#stage('round-read', stats, () =>
+                this.#drainPendingLikes(stats)
+            )
+            await this.#stage('round-read', stats, () =>
                 this.#discoverFriendPosts(stats)
             )
             trimMonitoredPosts(this.state, this.#options.monitorLimit)
@@ -162,6 +172,17 @@ export class AutoInteractionRuntime {
                 this.#processPending(stats)
             )
             if (this.stopped) return
+            const pruned = pruneTerminalTriggers(
+                this.state,
+                this.#deps.now().getTime()
+            )
+            if (pruned.expired > 0 || pruned.overflow > 0) {
+                this.#debug(
+                    'state-pruned',
+                    '已收敛历史终态记录',
+                    pruned
+                )
+            }
             this.#lastRoundAt = this.#deps.now().toISOString()
             this.#lastRound = { ...stats }
             this.#setReport('ready', '等待下一轮')
@@ -273,10 +294,10 @@ export class AutoInteractionRuntime {
                 next.friendFeedWatermark !== null &&
                 next.friendFeedWatermark.timestamp < next.baselineCompletedAt
             ) {
-                next.friendFeedWatermark = {
-                    timestamp: next.baselineCompletedAt,
-                    keysAtTimestamp: new Set()
-                }
+                next.friendFeedWatermark = raiseFriendFeedWatermark(
+                    next.friendFeedWatermark,
+                    next.baselineCompletedAt
+                )
             }
             if (this.stopped) return
             this.state = next
@@ -285,6 +306,7 @@ export class AutoInteractionRuntime {
             this.#friendFeedCursor = undefined
             this.#friendFeedCandidateWatermark = null
             for (const key of nextKnownSelf) this.#knownSelfPosts.add(key)
+            this.#trimKnownSelfPosts()
             this.#lastError = null
             this.#setReport('ready', '启动基线已建立')
             this.#deps.logger.info('自动互动：启动基线已建立')
@@ -317,6 +339,7 @@ export class AutoInteractionRuntime {
         let cursor: string | undefined
         const pageLimit = Math.ceil(limit / FEED_PAGE_SIZE)
         for (let pageIndex = 0; pageIndex < pageLimit; pageIndex++) {
+            if (posts.length >= limit) break
             const page = await this.#deps.listFeedPage({
                 scope: 'self',
                 limit: Math.min(FEED_PAGE_SIZE, limit - posts.length),
@@ -405,6 +428,7 @@ export class AutoInteractionRuntime {
             this.state.monitoredPosts.set(key, monitored)
             candidates.push(monitored)
         }
+        this.#trimKnownSelfPosts()
         if (candidates.length === 0) return
         const details = await mapWithConcurrency(candidates, (monitored) =>
             this.#deps.getPost({
@@ -518,9 +542,7 @@ export class AutoInteractionRuntime {
                 }
             }
             const reachedOld = page.items.some((post) => {
-                if (post.createdAt === null) return false
-                const at = Date.parse(post.createdAt)
-                return Number.isFinite(at) && at < watermark.timestamp
+                return isPostBeforeWatermark(post, watermark)
             })
             if (reachedOld || !page.nextCursor || page.items.length === 0) {
                 this.state.friendFeedWatermark = candidate
@@ -544,13 +566,15 @@ export class AutoInteractionRuntime {
     async #likeDiscoveredPost(
         post: QzonePost,
         stats: ReturnType<typeof mutableRoundStats>,
-        source: 'forced' | 'model'
+        source: 'forced' | 'model' | 'retry'
     ): Promise<void> {
+        const key = postKey(post)
         if (post.liked) {
             this.#debug(
                 'like-skipped',
                 `动态已处于点赞态，跳过（post=${post.id}）`
             )
+            this.#pendingLikes.delete(key)
             return
         }
         if (
@@ -561,6 +585,7 @@ export class AutoInteractionRuntime {
                 'like-capped',
                 `已达单轮写请求上限，跳过点赞（post=${post.id}）`
             )
+            this.#enqueuePendingLike(post)
             return
         }
         stats.likeAttempts += 1
@@ -570,6 +595,7 @@ export class AutoInteractionRuntime {
                 signal: this.#controller.signal
             })
             if (this.stopped) return
+            this.#pendingLikes.delete(key)
             if (result.outcome === 'already-applied') {
                 stats.likeAlreadyApplied += 1
             } else {
@@ -592,10 +618,56 @@ export class AutoInteractionRuntime {
                 error: describeError(error),
                 authFailure: error instanceof QzoneWriteAuthError
             })
+            if (error instanceof QzoneNotFoundError) {
+                this.#pendingLikes.delete(key)
+            } else {
+                this.#enqueuePendingLike(post)
+            }
             this.#recordError(
                 error instanceof QzoneWriteAuthError ? 'write-auth' : 'write',
                 stats
             )
+        }
+    }
+
+    #enqueuePendingLike(post: QzonePost): void {
+        const key = postKey(post)
+        if (this.#pendingLikes.has(key)) return
+        this.#pendingLikes.set(key, post)
+        while (this.#pendingLikes.size > MAX_PENDING_LIKES) {
+            const oldest = this.#pendingLikes.keys().next()
+            if (oldest.done) break
+            this.#pendingLikes.delete(oldest.value)
+        }
+    }
+
+    #trimKnownSelfPosts(): void {
+        const limit = Math.max(
+            KNOWN_SELF_POST_MINIMUM,
+            this.#options.monitorLimit * 4
+        )
+        while (this.#knownSelfPosts.size > limit) {
+            const oldest = this.#knownSelfPosts.values().next()
+            if (oldest.done) break
+            this.#knownSelfPosts.delete(oldest.value)
+        }
+    }
+
+    async #drainPendingLikes(
+        stats: ReturnType<typeof mutableRoundStats>
+    ): Promise<void> {
+        if (this.#pendingLikes.size === 0) return
+        for (const [key, post] of [...this.#pendingLikes]) {
+            if (this.stopped) return
+            if (!this.#pendingLikes.has(key)) continue
+            if (
+                stats.writeAttempts + stats.likeAttempts >=
+                this.#options.maxWritesPerRound
+            ) {
+                return
+            }
+            this.#pendingLikes.delete(key)
+            await this.#likeDiscoveredPost(post, stats, 'retry')
         }
     }
 

@@ -1,5 +1,6 @@
 import type { Command, Context } from 'koishi'
-import type { QzonePost } from 'qzone-sdk'
+import type { FeedPage, QzonePost } from 'qzone-sdk'
+import { describeError } from '../auto-interaction/errors'
 
 const SUMMARY_MAX_LENGTH = 80
 const SUMMARY_ELLIPSIS = '……'
@@ -51,22 +52,28 @@ export function registerFeeds(
         .action(async (_argv, count, target) => {
             const limit = clampCount(count, defaultLimit())
             const userId = typeof target === 'string' ? target.trim() : ''
-            const scope = userId.length > 0 ? 'profile' : 'self'
-            const page =
-                await pluginCtx.chatluna_qzone_interaction.listFeedPage({
-                scope,
-                ...(userId.length > 0 ? { userId } : {}),
-                limit
-            })
-            if (page.items.length === 0) {
-                return `${userId.length > 0 ? `QQ ${userId}` : '自己'}没有可显示的动态。`
+            const label = userId.length > 0 ? `QQ ${userId}` : '自己'
+            let page: FeedPage
+            try {
+                page = await pluginCtx.chatluna_qzone_interaction.listFeedPage({
+                    scope: userId.length > 0 ? 'profile' : 'self',
+                    ...(userId.length > 0 ? { userId } : {}),
+                    limit
+                })
+            } catch (error) {
+                pluginCtx.logger.warn(
+                    `qzone.feeds 读取失败（${label}）：${describeError(error)}`
+                )
+                return (
+                    `读取${label}的空间动态失败：${describeError(error)}\n` +
+                    '可用 qzone.status 查看登录态与自动续绑状态。'
+                )
             }
-            const header =
-                `${userId.length > 0 ? `QQ ${userId}` : '自己'}的空间动态` +
-                `（${page.items.length} 条）`
+            if (page.items.length === 0) {
+                return `${label}没有可显示的动态。`
+            }
             return (
-                header +
-                '\n' +
+                `${label}的空间动态（${page.items.length} 条）\n` +
                 page.items.map(describePost).join('\n')
             )
         })
