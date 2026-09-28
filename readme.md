@@ -138,7 +138,7 @@
 | 贡献者 | 贡献内容 |
 |------|------|
 | Procyon-Nan | 上游项目 [koishi-plugin-chatluna-livingdiary](https://github.com/Procyon-Nan/koishi-plugin-chatluna-livingdiary) 作者 |
-| Minecraft-1314 | 本仓库开发：补全上游功能、纯文本决策契约、图片描述通道、评论与点赞模式、Milky 协议、互动白名单、可编辑提示词 |
+| Minecraft-1314 | 本仓库开发：纯文本决策契约、图片描述通道、评论与点赞模式、可编辑提示词 |
 
 > 欢迎通过 Issues 或 PR 加入贡献者列表。
 
