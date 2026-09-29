@@ -2,6 +2,7 @@ import type { Command, Context } from 'koishi'
 import type { InteractionReport } from '../auto-interaction/report'
 import type { DigestReport } from '../digest/report'
 import type { RebindStats } from '../qzone/rebind'
+import type { PublishCapability } from '../xml-tool'
 
 const TIME = new Intl.DateTimeFormat('zh-CN', {
     timeZone: 'Asia/Shanghai',
@@ -73,6 +74,29 @@ const describeDigest = (report: DigestReport | null): string => {
 export interface StatusDeps {
     readonly interaction: () => InteractionReport | null
     readonly digest: () => DigestReport | null
+    readonly publish: () => PublishCapability
+}
+
+const describePublish = (capability: PublishCapability): string[] => {
+    const state = capability.mounted
+        ? '可用'
+        : capability.enabled
+          ? '不可用'
+          : '已关闭'
+    const lines = [`状态：${state}`, `说明：${capability.detail}`]
+    lines.push(
+        '标签捕获 ' +
+            capability.observed +
+            ' 次，发布成功 ' +
+            capability.published +
+            ' 次，失败 ' +
+            capability.failed +
+            ' 次'
+    )
+    if (capability.enabled && !capability.mounted) {
+        lines.push('模型此时无法主动发布，请勿相信它「已发布」的说法')
+    }
+    return lines
 }
 
 export function registerStatus(
@@ -104,7 +128,10 @@ export function registerStatus(
                 describeInteraction(deps.interaction()),
                 '',
                 '每日记忆动态：',
-                describeDigest(deps.digest())
+                describeDigest(deps.digest()),
+                '',
+                '模型主动发布（<qzone_publish>）：',
+                describePublish(deps.publish()).join('\n')
             ].join('\n')
         })
 }

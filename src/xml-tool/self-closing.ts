@@ -38,6 +38,9 @@ export const parseAttributes = (source: string): Record<string, string> => {
 const tagPattern = (tagName: string): RegExp =>
     new RegExp(`<${tagName}\\b([^>]*?)/\\s*>`, 'giu')
 
+const pairedTagPattern = (tagName: string): RegExp =>
+    new RegExp(`<${tagName}\\b([^>]*)>([\\s\\S]*?)</${tagName}\\s*>`, 'giu')
+
 export function parseSelfClosingXmlTags(
     text: string,
     tagName: string
@@ -51,3 +54,28 @@ export function parseSelfClosingXmlTags(
     }
     return results
 }
+
+const BODY_ATTRIBUTE = 'content'
+
+export function parsePublishTags(
+    text: string,
+    tagName: string
+): Record<string, string>[] {
+    const selfClosing = parseSelfClosingXmlTags(text, tagName)
+    if (typeof text !== 'string' || text.length === 0) return selfClosing
+    const results: Record<string, string>[] = selfClosing.slice()
+    const pattern = pairedTagPattern(tagName)
+    let match: RegExpExecArray | null
+    while ((match = pattern.exec(stripSelfClosing(text, tagName))) !== null) {
+        const attrs = parseAttributes(match[1] ?? '')
+        const body = (match[2] ?? '').trim()
+        if (body.length > 0 && !attrs[BODY_ATTRIBUTE]) {
+            attrs[BODY_ATTRIBUTE] = body
+        }
+        results.push(attrs)
+    }
+    return results
+}
+
+const stripSelfClosing = (text: string, tagName: string): string =>
+    text.replace(tagPattern(tagName), ' ')

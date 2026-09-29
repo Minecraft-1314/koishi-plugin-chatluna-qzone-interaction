@@ -35,7 +35,8 @@ export function apply(ctx: Context, config: Config) {
     let digestRef: DigestRuntime | null = digest
     const publishTool = new PublishXmlTool(ctx, config, ctx.logger)
     applyCommands(ctx, config, reports, {
-        digest: () => digestRef
+        digest: () => digestRef,
+        publish: () => publishTool.capability
     })
     ctx.plugin({
         inject: autoInteractionEntry.inject,
@@ -45,6 +46,7 @@ export function apply(ctx: Context, config: Config) {
     ctx.inject(['chatluna_character'], () => {
         publishTool.start()
     })
+    publishTool.start()
     ctx.on('ready', () => {
         digest.start()
     })

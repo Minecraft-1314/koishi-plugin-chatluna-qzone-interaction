@@ -1,4 +1,5 @@
 import type { Context } from 'koishi'
+import { SystemMessage } from '@langchain/core/messages'
 import type { Config } from '../config'
 import type { LivingDiaryLogger } from '../logging'
 import { publishQzonePost } from '../publish'
@@ -7,12 +8,25 @@ import {
     subscribeAssistantResponses,
     type TempLike
 } from './character-runtime'
-import { parseSelfClosingXmlTags } from './self-closing'
+import { parsePublishTags } from './self-closing'
 
 export const PUBLISH_TAG = 'qzone_publish'
 const MAX_TAGS_PER_RESPONSE = 3
 const PUBLISH_RETRY_DELAY_MS = 1000
 const PUBLISH_MAX_RETRIES = 3
+const MAX_FEEDBACK_PENDING = 8
+
+const PUBLISH_OUTCOME_FEEDBACK: Record<string, string> = {
+    verified: '已成功发布到 QQ 空间（已读回确认）：',
+    accepted: '已提交到 QQ 空间，但服务端尚未读回确认：',
+    unknown:
+        '结果不确定，无法确认是否发布成功，请先用 qzone.feeds 核对后再答复用户：',
+    'already-applied': '该动态此前已经发布过，本次未重复提交：'
+}
+
+const feedbackForOutcome = (outcome: string, detail: string): string =>
+    (PUBLISH_OUTCOME_FEEDBACK[outcome] ??
+        '发布返回未知结果，无法确认是否成功：') + detail
 
 interface CharacterServiceLike {
     getTemp?: (...args: unknown[]) => Promise<TempLike>
@@ -34,6 +48,22 @@ interface ToolStats {
     observed: number
     published: number
     failed: number
+}
+
+export type PublishCapabilityReason =
+    | 'disabled'
+    | 'missing-character'
+    | 'mount-failed'
+    | 'ready'
+
+export interface PublishCapability {
+    readonly enabled: boolean
+    readonly mounted: boolean
+    readonly reason: PublishCapabilityReason
+    readonly detail: string
+    readonly observed: number
+    readonly published: number
+    readonly failed: number
 }
 
 const readCharacterService = (
@@ -61,6 +91,9 @@ export class PublishXmlTool {
     #publishQueue: Array<{ attrs: Record<string, string>; retries: number }> = []
     #publishing = false
     #generation = 0
+    #reason: PublishCapabilityReason = 'disabled'
+    #detail = ''
+    #pendingFeedback: string[] = []
 
     constructor(
         private readonly ctx: Context,
@@ -72,11 +105,26 @@ export class PublishXmlTool {
         return this.#stats
     }
 
+    get capability(): PublishCapability {
+        return {
+            enabled: this.config.enablePublishTool,
+            mounted: this.#reason === 'ready',
+            reason: this.#reason,
+            detail: this.#detail,
+            observed: this.#stats.observed,
+            published: this.#stats.published,
+            failed: this.#stats.failed
+        }
+    }
+
     start(): void {
         if (!this.config.enablePublishTool) {
+            this.#reason = 'disabled'
+            this.#detail = '配置项 enablePublishTool 已关闭，模型无法主动发布空间动态'
             this.logger.debug('qzone_publish XML 发布能力未启用')
             return
         }
+        if (this.#dispose !== null) return
         const service = readCharacterService(this.ctx)
         if (service === null) {
             this.#warnMissingCharacter()
@@ -91,6 +139,7 @@ export class PublishXmlTool {
             (temp, session) => {
                 const list = temp?.completionMessages
                 if (!Array.isArray(list)) return
+                this.#flushFeedback(list)
                 const key = list as unknown as object
                 sessions.set(key, session)
                 if (unsubscribes.has(key)) return
@@ -111,11 +160,16 @@ export class PublishXmlTool {
             (args) => args[0] ?? null
         )
         if (detach === null) {
-            this.#warnMissingCharacter()
+            this.#reason = 'mount-failed'
+            this.#detail =
+                'chatluna_character 服务存在但 getTemp 不可用，发布能力挂载失败'
+            this.logger.warn('qzone_publish XML 发布能力挂起：' + this.#detail)
             return
         }
         this.#dispose = detach
         this.#promptDispose = this.#injectPrompt()
+        this.#reason = 'ready'
+        this.#detail = '已挂载，等待模型输出 <' + PUBLISH_TAG + '> 标签'
         this.logger.info('qzone_publish XML 发布能力已挂载（Character 流程）')
     }
 
@@ -129,18 +183,26 @@ export class PublishXmlTool {
         this.#generation += 1
         this.#publishQueue = []
         this.#publishing = false
+        this.#pendingFeedback = []
+        if (this.#reason === 'ready') {
+            this.#reason = 'missing-character'
+            this.#detail = '已随插件卸载'
+        }
     }
 
     #warnMissingCharacter(): void {
+        this.#reason = 'missing-character'
+        this.#detail =
+            '未检测到可用的 chatluna_character 服务，模型无法主动发布空间动态'
         if (this.#warned) return
         this.#warned = true
         this.logger.warn(
-            'qzone_publish XML 发布能力挂起：未检测到可用的 chatluna_character 服务'
+            'qzone_publish XML 发布能力挂起：' + this.#detail
         )
     }
 
     #onResponse(response: string): void {
-        const tags = parseSelfClosingXmlTags(response, PUBLISH_TAG)
+        const tags = parsePublishTags(response, PUBLISH_TAG)
         if (tags.length === 0) return
         this.#stats.observed += tags.length
         if (this.config.debug) {
@@ -158,6 +220,31 @@ export class PublishXmlTool {
         void this.#processQueue()
     }
 
+    #recordFeedback(text: string): void {
+        if (this.#pendingFeedback.length >= MAX_FEEDBACK_PENDING) {
+            this.#pendingFeedback.shift()
+        }
+        this.#pendingFeedback.push(text)
+    }
+
+    #flushFeedback(list: unknown[]): void {
+        if (this.#pendingFeedback.length === 0) return
+        const lines = this.#pendingFeedback
+        this.#pendingFeedback = []
+        list.push(
+            new SystemMessage(
+                '<qzone_publish_result>\n' +
+                    lines
+                        .map((line) => '- ' + line)
+                        .join('\n') +
+                    '\n</qzone_publish_result>\n' +
+                    '以上是你上一轮请求发布 QQ 空间动态的真实结果。' +
+                    '请据此如实告知用户：只有结果为成功时才能说已发布；' +
+                    '失败时必须说明失败原因。不要凭猜测宣布发布成功。'
+            )
+        )
+    }
+
     async #processQueue(): Promise<void> {
         if (this.#publishing) return
         this.#publishing = true
@@ -173,6 +260,9 @@ export class PublishXmlTool {
             if (generation !== this.#generation) return
             this.#stats.failed += this.#publishQueue.length
             this.#publishQueue = []
+            this.#recordFeedback(
+                '未发布到 QQ 空间：发布队列异常中断 ' + errorText(error)
+            )
             this.logger.warn(
                 '[qzone_publish] 发布队列异常中断：' + errorText(error)
             )
@@ -187,7 +277,9 @@ export class PublishXmlTool {
     ): Promise<void> {
         const content = (attrs['content'] ?? '').trim()
         if (content.length === 0) {
-            this.logger.warn('qzone_publish：标签缺少 content 属性，已忽略')
+            const text = '未发布：<qzone_publish> 标签缺少 content 属性'
+            this.#recordFeedback(text)
+            this.logger.warn('qzone_publish：' + text + '，已忽略')
             return
         }
         const imageUrls = Object.keys(attrs)
@@ -203,6 +295,7 @@ export class PublishXmlTool {
             })
             if (result.ok) {
                 this.#stats.published += 1
+                this.#recordFeedback(feedbackForOutcome(result.outcome, result.text))
                 this.logger.info('[qzone_publish] ' + result.text)
                 return
             }
@@ -215,6 +308,7 @@ export class PublishXmlTool {
                 return
             }
             this.#stats.failed += 1
+            this.#recordFeedback('未发布到 QQ 空间：' + result.text)
             this.logger.warn('[qzone_publish] ' + result.text)
         } catch (error) {
             if (currentRetries < PUBLISH_MAX_RETRIES) {
@@ -226,6 +320,7 @@ export class PublishXmlTool {
                 return
             }
             this.#stats.failed += 1
+            this.#recordFeedback('未发布到 QQ 空间：发布异常 ' + errorText(error))
             this.logger.warn('[qzone_publish] 发布异常 ' + errorText(error))
         }
     }

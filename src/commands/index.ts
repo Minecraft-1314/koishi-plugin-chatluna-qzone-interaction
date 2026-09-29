@@ -7,6 +7,7 @@ import { registerFeeds } from './feeds'
 import { createAllowGuard } from './guard'
 import { registerPublish } from './publish'
 import { registerStatus } from './status'
+import type { PublishCapability } from '../xml-tool'
 
 export const QZONE_COMMAND_NAME = 'qzone'
 
@@ -21,6 +22,7 @@ const USAGE_LINES = [
 
 export interface CommandDeps {
     readonly digest: () => DigestRuntime | null
+    readonly publish: () => PublishCapability
 }
 
 export function applyCommands(
@@ -38,7 +40,8 @@ export function applyCommands(
     registerPublish(command, ctx, () => config.debug)
     registerStatus(command, ctx, {
         interaction: () => reports.interaction.get(),
-        digest: () => deps.digest()?.report ?? null
+        digest: () => deps.digest()?.report ?? null,
+        publish: () => deps.publish()
     })
     registerDigest(command, deps.digest)
 }
