@@ -24,6 +24,9 @@ import {
     type RebindStats
 } from './rebind'
 
+const FRIEND_FEED_MAX_ROUNDS = 8
+const FEED_LIMIT_MAX = 20
+
 export interface FeedQuery {
     readonly scope: 'self' | 'profile' | 'friends'
     readonly userId?: string
@@ -87,8 +90,58 @@ export class QzoneManager {
     }
 
     async listFeedPage(query: FeedQuery): Promise<FeedPage> {
-        const options = toListOptions(query)
-        return this.#runRead('读取动态', (client) => client.listFeeds(options))
+        return this.#runRead('读取动态', (client) =>
+            this.#collectFeedPage(client, query)
+        )
+    }
+
+    async #collectFeedPage(
+        client: QzoneClient,
+        query: FeedQuery
+    ): Promise<FeedPage> {
+        const limit = normalizeFeedLimit(query.limit)
+        const first = normalizeFeedPage(await client.listFeeds(toListOptions({ ...query, limit })))
+        if (query.scope !== 'friends') {
+            return { items: first.items.slice(0, limit), nextCursor: first.nextCursor }
+        }
+        return this.#extendFriendFeed(client, { ...query, limit }, first, limit)
+    }
+
+    async #extendFriendFeed(
+        client: QzoneClient,
+        query: FeedQuery,
+        first: FeedPage,
+        limit: number
+    ): Promise<FeedPage> {
+        const items = [...first.items]
+        const seen = new Set(items.map(feedItemKey))
+        let cursor = first.nextCursor
+        let rounds = 0
+        while (
+            cursor !== null &&
+            items.length < limit &&
+            rounds < FRIEND_FEED_MAX_ROUNDS
+        ) {
+            rounds += 1
+            const page = normalizeFeedPage(
+                await client.listFeeds(toListOptions({ ...query, cursor }))
+            )
+            let added = 0
+            for (const post of page.items) {
+                const key = feedItemKey(post)
+                if (seen.has(key)) continue
+                seen.add(key)
+                items.push(post)
+                added += 1
+                if (items.length >= limit) break
+            }
+            if (added === 0 || page.nextCursor === cursor) break
+            cursor = page.nextCursor
+        }
+        return {
+            items: items.slice(0, limit),
+            nextCursor: cursor
+        }
     }
 
     getPost(request: GetPostOptions): Promise<QzonePost> {
@@ -260,6 +313,31 @@ export class QzoneManager {
         }
     }
 }
+
+const FEED_LIMIT_FALLBACK = 10
+
+const normalizeFeedLimit = (value: number): number => {
+    if (!Number.isFinite(value)) return FEED_LIMIT_FALLBACK
+    const rounded = Math.trunc(value)
+    if (rounded < 1) return 1
+    return Math.min(rounded, FEED_LIMIT_MAX)
+}
+
+const isUsablePost = (post: unknown): post is QzonePost => {
+    if (post === null || typeof post !== 'object') return false
+    const candidate = post as { id?: unknown; authorId?: unknown }
+    return typeof candidate.id === 'string' && typeof candidate.authorId === 'string'
+}
+
+const normalizeFeedPage = (page: FeedPage | undefined | null): FeedPage => {
+    const raw = page?.items
+    const items = Array.isArray(raw) ? raw.filter(isUsablePost) : []
+    const cursor = typeof page?.nextCursor === 'string' ? page.nextCursor : null
+    return { items, nextCursor: cursor }
+}
+
+const feedItemKey = (post: QzonePost): string =>
+    post.id + '\u0000' + post.authorId
 
 function toListOptions(query: FeedQuery): ListFeedsOptions {
     const page = {

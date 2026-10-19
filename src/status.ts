@@ -13,9 +13,14 @@ function createReportSlot<T>() {
     }
 }
 
+export interface InteractionRuntimeHandle {
+    dropRetry(key: string): boolean
+}
+
 export function createRuntimeReports() {
     return {
-        interaction: createReportSlot<InteractionReport>()
+        interaction: createReportSlot<InteractionReport>(),
+        interactionRuntime: createReportSlot<InteractionRuntimeHandle>()
     }
 }
 

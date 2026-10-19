@@ -1,6 +1,7 @@
 import type { Context, h } from 'koishi'
 import type { PublishImageInput } from 'qzone-sdk'
 import { mapWithConcurrency } from '../auto-interaction/concurrency'
+import { sniffImageMime } from '../image-mime'
 import {
     PUBLISH_IMAGE_FETCH_CONCURRENCY,
     PUBLISH_IMAGE_FETCH_TIMEOUT_MS,
@@ -10,14 +11,12 @@ import {
 
 const EXTENSION_BY_MIME: Record<string, string> = {
     'image/jpeg': 'jpg',
-    'image/jpg': 'jpg',
     'image/png': 'png',
     'image/gif': 'gif',
-    'image/webp': 'webp',
-    'image/bmp': 'bmp'
+    'image/webp': 'webp'
 }
 
-const EXTENSION_BY_URL = /\.(jpe?g|png|gif|webp|bmp)(?:[?#]|$)/iu
+const EXTENSION_BY_URL = /\.(jpe?g|png|gif|webp)(?:[?#]|$)/iu
 
 const withTimeout = async <T>(
     task: Promise<T>,
@@ -63,8 +62,74 @@ export const collectImageUrls = (elements: readonly h[]): string[] => {
     return urls
 }
 
-export const extractImageUrls = (elements: readonly h[]): string[] =>
-    collectImageUrls(elements).slice(0, PUBLISH_MAX_IMAGES)
+const DOMAIN_MEDIA_TYPES = new Set(['text', 'img', 'video'])
+
+const DATA_URL_PATTERN =
+    /^data:image\/([a-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/iu
+
+const collectElementTypes = (
+    elements: readonly h[],
+    accept: (type: string) => boolean
+): string[] => {
+    const kinds: string[] = []
+    for (const element of elements) {
+        if (element == null) continue
+        if (accept(element.type)) continue
+        if (kinds.includes(element.type)) continue
+        kinds.push(element.type)
+    }
+    return kinds
+}
+
+export const collectUnsupportedFormats = (
+    elements: readonly h[]
+): string[] =>
+    collectElementTypes(elements, (type) => DOMAIN_MEDIA_TYPES.has(type))
+
+export const collectVideoAttachments = (
+    elements: readonly h[]
+): boolean => elements.some((element) => element?.type === 'video')
+
+export const decodePublishImages = (
+    dataUrls: readonly string[],
+    maxBytes: number
+): { images: PublishImageInput[]; errors: string[] } => {
+    const images: PublishImageInput[] = []
+    const errors: string[] = []
+    const source = Array.isArray(dataUrls) ? dataUrls : []
+    for (const [index, raw] of source.entries()) {
+        const label = `第 ${index + 1} 张图片`
+        const matched = DATA_URL_PATTERN.exec(String(raw).trim())
+        if (matched === null) {
+            errors.push(`${label}不是有效的图片数据`)
+            continue
+        }
+        const bytes = new Uint8Array(
+            Buffer.from(matched[2] ?? '', 'base64')
+        )
+        if (bytes.byteLength === 0) {
+            errors.push(`${label}内容为空`)
+            continue
+        }
+        if (bytes.byteLength > maxBytes) {
+            errors.push(
+                `${label} ${formatBytes(bytes.byteLength)} 超过 32MB 上限`
+            )
+            continue
+        }
+        const mime = sniffImageMime(bytes)
+        if (mime === null) {
+            errors.push(`${label}真实格式不受支持`)
+            continue
+        }
+        images.push({
+            data: bytes,
+            name: `image.${EXTENSION_BY_MIME[mime] ?? 'bin'}`,
+            mimeType: mime
+        })
+    }
+    return { images, errors }
+}
 
 export interface FetchedImage {
     readonly input: PublishImageInput
@@ -72,7 +137,7 @@ export interface FetchedImage {
 }
 
 export async function fetchPublishImages(
-    ctx: Context,
+    http: Context['http'],
     urls: readonly string[]
 ): Promise<{ images: FetchedImage[]; errors: string[] }> {
     const targets = urls.slice(0, PUBLISH_MAX_IMAGES)
@@ -83,19 +148,19 @@ export async function fetchPublishImages(
                 if (!isRemoteImageUrl(url)) {
                     throw new Error('仅支持 http/https 图片地址')
                 }
-                const response = await withTimeout(
-                    ctx.http.get(url),
+                const buffer = await withTimeout(
+                    http.get(url, { responseType: 'arraybuffer' }),
                     PUBLISH_IMAGE_FETCH_TIMEOUT_MS
                 )
-                const mimeType = String(
-                    response.type ?? response.headers?.['content-type'] ?? ''
-                )
-                    .split(';')[0]
-                    .trim()
-                    .toLowerCase()
-                const data = new Uint8Array(response.data)
+                const data = new Uint8Array(buffer)
                 if (data.byteLength === 0) {
                     throw new Error('图片内容为空')
+                }
+                const mimeType = sniffImageMime(data)
+                if (mimeType === null) {
+                    throw new Error(
+                        '图片真实格式不受支持（仅支持 JPEG / PNG / GIF / WebP）'
+                    )
                 }
                 if (data.byteLength > PUBLISH_MAX_IMAGE_BYTES) {
                     throw new Error(
@@ -108,7 +173,7 @@ export async function fetchPublishImages(
                     input: {
                         data,
                         name: guessName(url, mimeType),
-                        ...(mimeType ? { mimeType } : {})
+                        mimeType
                     },
                     url
                 } satisfies FetchedImage

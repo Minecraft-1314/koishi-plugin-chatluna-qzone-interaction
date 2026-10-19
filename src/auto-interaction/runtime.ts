@@ -16,8 +16,18 @@ import type {
 } from './agent'
 import type { DecisionPolicy } from './decision'
 import { buildInteractionPrompt } from './prompt'
-import { isCommentInBotThread } from './state'
-import { declaresImageInput, type PreparedInteractionMedia } from './media'
+import {
+    collectRetryViews,
+    countPendingRetries,
+    createBaselineWatermark,
+    isCommentInBotThread,
+    recordPendingFailure
+} from './state'
+import {
+    declaresImageInput,
+    emptyPreparedMedia,
+    type PreparedInteractionMedia
+} from './media'
 import {
     advanceFriendFeedWatermark,
     baselineMonitoredPost,
@@ -36,7 +46,6 @@ import {
     type PendingTrigger,
     postKey,
     pruneTerminalTriggers,
-    raiseFriendFeedWatermark,
     removeMonitoredPost,
     sortPendingTriggers,
     terminalizeTrigger,
@@ -58,6 +67,7 @@ import { QzoneWriteAuthError } from '../qzone/manager'
 import { type LivingDiaryLogger } from '../logging'
 
 export const FRIEND_FEED_PAGE_LIMIT = 6
+const MINUTE_MS = 60 * 1000
 const FEED_PAGE_SIZE = 20
 const MAX_PENDING_LIKES = 200
 const KNOWN_SELF_POST_MINIMUM = 64
@@ -265,6 +275,7 @@ export class AutoInteractionRuntime {
                 })
                 trimMonitoredPosts(next, this.#options.monitorLimit)
             }
+            let baselineFeed: readonly QzonePost[] = []
             if (
                 this.#options.friendPostCommentMode !== 'off' ||
                 this.#options.friendPostLikeMode !== 'off'
@@ -275,6 +286,7 @@ export class AutoInteractionRuntime {
                     limit: FEED_PAGE_SIZE,
                     signal: this.#controller.signal
                 })
+                baselineFeed = page.items
                 next.friendFeedWatermark = createFriendFeedWatermark(
                     page.items,
                     friendBaselineAt
@@ -290,13 +302,11 @@ export class AutoInteractionRuntime {
                 monitored.ignoreCommentsThrough = next.baselineCompletedAt
                 monitored.baselineObservationPending = true
             }
-            if (
-                next.friendFeedWatermark !== null &&
-                next.friendFeedWatermark.timestamp < next.baselineCompletedAt
-            ) {
-                next.friendFeedWatermark = raiseFriendFeedWatermark(
-                    next.friendFeedWatermark,
-                    next.baselineCompletedAt
+            if (next.friendFeedWatermark !== null) {
+                next.friendFeedWatermark = createBaselineWatermark(
+                    baselineFeed,
+                    next.baselineCompletedAt -
+                        this.#options.baselineGraceMinutes * MINUTE_MS
                 )
             }
             if (this.stopped) return
@@ -321,7 +331,7 @@ export class AutoInteractionRuntime {
                 })),
                 friendWatermark: next.friendFeedWatermark?.timestamp ?? null,
                 baselineCompletedAt: next.baselineCompletedAt,
-                note: '基线完成前已存在的动态与评论不会被补扫，请在本条之后再发布内容'
+                note: '启动基线只回溯 friendFeedBaselineGraceMinutes 分钟内的好友动态'
             })
         } catch (error) {
             if (this.stopped) return
@@ -836,12 +846,27 @@ export class AutoInteractionRuntime {
                     return
                 }
             }
-            const media = await this.#deps.prepareMedia(
-                detail.media,
-                model,
-                this.#deps.canDescribeMedia(),
-                this.#controller.signal
-            )
+            let media: PreparedInteractionMedia
+            try {
+                media = await this.#deps.prepareMedia(
+                    detail.media,
+                    model,
+                    this.#deps.canDescribeMedia(),
+                    this.#controller.signal
+                )
+            } catch (error) {
+                if (this.stopped) return
+                this.#debug(
+                    'media-failed',
+                    '媒体准备失败，本条按纯文本继续处理',
+                    describeError(error)
+                )
+                this.#deps.logger.warn(
+                    '自动互动：媒体准备失败，本条按纯文本处理 ' +
+                        describeError(error)
+                )
+                media = emptyPreparedMedia()
+            }
             if (this.stopped) return
             this.#debug('media-ready', '媒体准备完成', {
                 sourceMedia: detail.media?.length ?? 0,
@@ -937,6 +962,20 @@ export class AutoInteractionRuntime {
                     `自动互动：模型决策失败（post=${trigger.post.id}）`
                 )
                 this.#recordError('model-decision', stats)
+                if (
+                    !this.#scheduleRetry(
+                        trigger,
+                        (error as Error).message,
+                        stats
+                    )
+                ) {
+                    terminalizeTrigger(
+                        this.state,
+                        trigger.key,
+                        'model-declined',
+                        this.#deps.now().getTime()
+                    )
+                }
                 continue
             }
             if (this.stopped) return
@@ -954,6 +993,20 @@ export class AutoInteractionRuntime {
                         `原因=${decision.error ?? 'unknown'}）`
                 )
                 this.#recordError('model-decision', stats)
+                if (
+                    !this.#scheduleRetry(
+                        trigger,
+                        decision.error ?? '模型决策无效',
+                        stats
+                    )
+                ) {
+                    terminalizeTrigger(
+                        this.state,
+                        trigger.key,
+                        'model-declined',
+                        this.#deps.now().getTime()
+                    )
+                }
                 continue
             }
             if (this.stopped) return
@@ -990,6 +1043,16 @@ export class AutoInteractionRuntime {
                     `自动互动：模型未产出评论正文（post=${trigger.post.id}）`
                 )
                 this.#recordError('model-decision', stats)
+                if (
+                    !this.#scheduleRetry(trigger, '模型未产出评论正文', stats)
+                ) {
+                    terminalizeTrigger(
+                        this.state,
+                        trigger.key,
+                        'model-declined',
+                        this.#deps.now().getTime()
+                    )
+                }
                 continue
             }
             stats.writeAttempts += 1
@@ -1024,19 +1087,16 @@ export class AutoInteractionRuntime {
                         authFailure: error instanceof QzoneWriteAuthError
                     }
                 )
+                const authFailure = error instanceof QzoneWriteAuthError
+                this.#recordError(authFailure ? 'write-auth' : 'write', stats)
+                if (this.#scheduleRetry(trigger, describeError(error), stats)) {
+                    continue
+                }
                 terminalizeTrigger(
                     this.state,
                     trigger.key,
-                    error instanceof QzoneWriteAuthError
-                        ? 'write-auth-failed'
-                        : 'write-failed-no-retry',
+                    authFailure ? 'write-auth-failed' : 'write-failed-no-retry',
                     this.#deps.now().getTime()
-                )
-                this.#recordError(
-                    error instanceof QzoneWriteAuthError
-                        ? 'write-auth'
-                        : 'write',
-                    stats
                 )
                 continue
             }
@@ -1165,6 +1225,53 @@ export class AutoInteractionRuntime {
         this.#deps.logger.info(`[自动互动/${event}] ${message}\n${rendered}`)
     }
 
+    dropRetry(key: string): boolean {
+        if (!this.state.pendingTriggers.has(key)) return false
+        terminalizeTrigger(
+            this.state,
+            key,
+            'write-failed-no-retry',
+            this.#deps.now().getTime()
+        )
+        return true
+    }
+
+    #scheduleRetry(
+        trigger: PendingTrigger,
+        reason: string,
+        stats: ReturnType<typeof mutableRoundStats>
+    ): boolean {
+        const attempts = recordPendingFailure(
+            this.state,
+            trigger.key,
+            reason
+        )
+        if (attempts <= this.#options.writeRetryLimit) {
+            stats.retried += 1
+            this.#debug(
+                'retry-scheduled',
+                `互动失败已记录，等待下次重试（post=${trigger.post.id}）`,
+                {
+                    attempts,
+                    limit: this.#options.writeRetryLimit,
+                    reason
+                }
+            )
+            this.#deps.logger.warn(
+                `自动互动：互动失败已记录（post=${trigger.post.id}，` +
+                    `第 ${attempts}/${this.#options.writeRetryLimit} 次重试，` +
+                    `原因=${reason}）`
+            )
+            return true
+        }
+        stats.exhausted += 1
+        this.#deps.logger.warn(
+            `自动互动：互动重试次数用尽，放弃（post=${trigger.post.id}，` +
+                `原因=${reason}）`
+        )
+        return false
+    }
+
     #setReport(
         phase: InteractionPhase,
         detail: string,
@@ -1183,6 +1290,9 @@ export class AutoInteractionRuntime {
             monitorLimit: this.#options.monitorLimit,
             pendingTriggers: this.state.pendingTriggers.size,
             maxWritesPerRound: this.#options.maxWritesPerRound,
+            retryLimit: this.#options.writeRetryLimit,
+            pendingRetries: countPendingRetries(this.state),
+            retries: collectRetryViews(this.state),
             round: currentRound ?? this.#lastRound,
             lastError: this.#lastError
         }

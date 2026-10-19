@@ -61,11 +61,9 @@ export const renderPresetPersona = async (
     presetId: string
 ): Promise<string> => {
     if (presetId.endsWith(characterPresetSuffix)) {
-        const character = (
-            ctx as Context & {
-                chatluna_character?: CharacterPresetProvider
-            }
-        ).chatluna_character
+        const character = ctx.get('chatluna_character' as never) as
+            | CharacterPresetProvider
+            | undefined
         if (character == null) {
             throw new Error(
                 'chatluna-character 插件未运行，无法渲染 Character 预设人设'
@@ -92,6 +90,30 @@ export const renderPresetPersona = async (
         .join('\n')
 }
 
+const errorText = (error: unknown): string =>
+    error instanceof Error ? error.message : String(error)
+
+const registerPresetWatcher = (
+    ctx: Context,
+    onIds: (ids: readonly string[]) => void
+): (() => void) | null => {
+    try {
+        const source = ctx.chatluna.preset.getAllPreset(false)
+        return watch(
+            source,
+            (ids) => onIds(toPresetIdList(ids)),
+            { immediate: true }
+        )
+    } catch (error) {
+        ctx.logger.warn(
+            'QQ 空间互动：无法读取 ChatLuna 预设列表，' +
+                '配置项 personaPresetId 退化为自由填写：' +
+                errorText(error)
+        )
+        return null
+    }
+}
+
 export const isModelConfigured = (model: unknown): model is string => {
     if (typeof model !== 'string') return false
     const trimmed = model.trim()
@@ -105,30 +127,35 @@ export function apply(ctx: Context): void {
         const ids = [
             ...new Set([...latestChatLunaIds, ...characterPresetIds])
         ].sort((left, right) => left.localeCompare(right))
-        ctx.schema.set(
-            livingDiaryPresetSchemaKind,
-            Schema.union(ids.map((id) => Schema.const(id)))
-        )
+        try {
+            ctx.schema.set(
+                livingDiaryPresetSchemaKind,
+                ids.length > 0
+                    ? Schema.union(ids.map((id) => Schema.const(id)))
+                    : Schema.string()
+            )
+        } catch (error) {
+            ctx.logger.warn(
+                'QQ 空间互动：注册人设预设候选项失败，' +
+                    '配置项 personaPresetId 退化为自由填写：' +
+                    errorText(error)
+            )
+        }
     }
-    const stop = watch(
-        ctx.chatluna.preset.getAllPreset(false),
-        (ids) => {
-            latestChatLunaIds = toPresetIdList(ids)
-            refresh()
-        },
-        { immediate: true }
-    )
-    ctx.effect(() => stop)
+    const stop = registerPresetWatcher(ctx, (ids) => {
+        latestChatLunaIds = ids
+        refresh()
+    })
+    if (stop !== null) ctx.effect(() => stop)
+    refresh()
     ctx.inject(['chatluna_character'], async (characterCtx) => {
         let active = true
         let refreshing = false
         let refreshPending = false
         let ignoreNextPresetUpdated = false
-        const character = (
-            characterCtx as Context & {
-                chatluna_character: CharacterPresetProvider
-            }
-        ).chatluna_character
+        const character = characterCtx.get(
+            'chatluna_character' as never
+        ) as unknown as CharacterPresetProvider
         const refreshCharacterPresets = async () => {
             if (refreshing) {
                 refreshPending = true

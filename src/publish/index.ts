@@ -1,8 +1,13 @@
+import type { PostMutationResult, PublishImageInput } from 'qzone-sdk'
 import type { Context } from 'koishi'
-import type { PostMutationResult } from 'qzone-sdk'
 import { QzoneWriteAuthError } from '../qzone/manager'
-import { fetchPublishImages } from './images'
-import { truncateContent } from './constants'
+import type { PublishContext } from './context'
+import { decodePublishImages, fetchPublishImages } from './images'
+import {
+    PUBLISH_MAX_IMAGES,
+    PUBLISH_MAX_IMAGE_BYTES,
+    truncateContent
+} from './constants'
 
 export const PUBLISH_OUTCOME_TEXT: Record<string, string> = {
     verified: '发布成功（已经读取确认）',
@@ -16,6 +21,7 @@ export const PUBLISH_OUTCOME_TEXT: Record<string, string> = {
 export interface PublishRequest {
     readonly content: string
     readonly imageUrls: readonly string[]
+    readonly images?: readonly string[]
     readonly debug?: boolean
 }
 
@@ -35,37 +41,77 @@ export type PublishResult =
       }
 
 export async function publishQzonePost(
-    ctx: Context,
+    ctx: PublishContext,
     request: PublishRequest
 ): Promise<PublishResult> {
-    const { text: content, truncated } = truncateContent(request.content)
+    if (request === null || typeof request !== 'object') {
+        return {
+            ok: false,
+            text: '发布参数无效，未发布。',
+            authExpired: false
+        }
+    }
+    const contentInput =
+        typeof request.content === 'string' ? request.content : ''
+    const { text: content, truncated } = truncateContent(contentInput)
     if (content.length === 0) {
         return { ok: false, text: '动态正文为空，未发布。', authExpired: false }
     }
-    let images: Awaited<
-        ReturnType<typeof fetchPublishImages>
-    >['images'] = []
-    if (request.imageUrls.length > 0) {
-        const fetched = await fetchPublishImages(ctx, request.imageUrls)
-        if (fetched.errors.length > 0) {
-            return {
-                ok: false,
-                text:
-                    '本次不发布（不会出现只发了部分图片的情况）：\n' +
-                    fetched.errors.map((line) => `- ${line}`).join('\n') +
-                    '\n请修正后重新执行。',
-                authExpired: false
-            }
+    const imageInputs = Array.isArray(request.images)
+        ? request.images.filter(
+              (item): item is string => typeof item === 'string'
+          )
+        : []
+    const imageUrls = Array.isArray(request.imageUrls)
+        ? request.imageUrls.filter(
+              (item): item is string => typeof item === 'string'
+          )
+        : []
+    const totalRequested = imageInputs.length + imageUrls.length
+    if (totalRequested > PUBLISH_MAX_IMAGES) {
+        return {
+            ok: false,
+            text:
+                '本次不发布：QQ 空间单条动态最多 ' +
+                `${PUBLISH_MAX_IMAGES} 张图片，当前提交了 ${totalRequested} 张。` +
+                '请减少后重新执行。',
+            authExpired: false
         }
-        images = fetched.images
+    }
+    const errors: string[] = []
+    let images: PublishImageInput[] = []
+    if (imageInputs.length > 0) {
+        const decoded = decodePublishImages(
+            imageInputs,
+            PUBLISH_MAX_IMAGE_BYTES
+        )
+        errors.push(...decoded.errors)
+        images = decoded.images
+    }
+    const remaining = Math.max(0, PUBLISH_MAX_IMAGES - images.length)
+    if (imageUrls.length > 0 && remaining > 0) {
+        const fetched = await fetchPublishImages(
+            ctx.http,
+            imageUrls.slice(0, remaining)
+        )
+        errors.push(...fetched.errors)
+        images = images.concat(fetched.images.map((item) => item.input))
+    }
+    if (errors.length > 0) {
+        return {
+            ok: false,
+            text:
+                '本次不发布（不会出现只发了部分图片的情况）：\n' +
+                errors.map((line) => `- ${line}`).join('\n') +
+                '\n请修正后重新执行。',
+            authExpired: false
+        }
     }
     let result: PostMutationResult
     try {
-        result = await ctx.chatluna_qzone_interaction.publishPost({
+        result = await ctx.target.publishPost({
             content,
-            ...(images.length > 0
-                ? { images: images.map((item) => item.input) }
-                : {})
+            ...(images.length > 0 ? { images } : {})
         })
     } catch (error) {
         if (request.debug) {

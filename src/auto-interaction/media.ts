@@ -5,8 +5,11 @@ import {
     type ChatLunaChatModel,
     IMAGE_INPUT_CAPABILITY
 } from '../chatluna'
+import { sniffImageMime } from '../image-mime'
+import { extractVideoFrames, type VideoFrameOptions } from './video-frames'
 
 export const INTERACTION_IMAGE_LIMIT = 9
+export const INTERACTION_VIDEO_LIMIT = 1
 export const FALLBACK_MAX_IMAGE_BASE64_BYTES = 20 * 1024 * 1024
 export const FALLBACK_MAX_TOTAL_BASE64_BYTES = 60 * 1024 * 1024
 const DOWNLOAD_TIMEOUT_MS = 30000
@@ -17,7 +20,7 @@ const DIRECT_IMAGE_MIME_TYPES = [
     'image/webp'
 ] as const
 
-export interface InteractionImagePart {
+export type InteractionImagePart = {
     readonly type: 'image_url'
     readonly image_url: { readonly url: string }
 }
@@ -40,6 +43,14 @@ export interface PreparedInteractionMedia {
 }
 
 type HttpLike = Context['http']
+
+export const emptyPreparedMedia = (): PreparedInteractionMedia => ({
+    lines: [],
+    imageParts: [],
+    descriptions: new Map(),
+    storageFallbacks: 0,
+    downloadFailedMedia: []
+})
 
 export function declaresImageInput(model: ChatLunaChatModel): boolean {
     return (
@@ -90,44 +101,6 @@ const mediaMetadata = (media: QzoneMedia, id: string): string => {
     return values.join(' ')
 }
 
-const imageMimeType = (bytes: Uint8Array): string | null => {
-    if (
-        bytes.length >= 3 &&
-        bytes[0] === 0xff &&
-        bytes[1] === 0xd8 &&
-        bytes[2] === 0xff
-    ) {
-        return 'image/jpeg'
-    }
-    if (
-        bytes.length >= 8 &&
-        bytes[0] === 0x89 &&
-        bytes[1] === 0x50 &&
-        bytes[2] === 0x4e &&
-        bytes[3] === 0x47 &&
-        bytes[4] === 0x0d &&
-        bytes[5] === 0x0a &&
-        bytes[6] === 0x1a &&
-        bytes[7] === 0x0a
-    ) {
-        return 'image/png'
-    }
-    if (
-        bytes.length >= 6 &&
-        ['GIF87a', 'GIF89a'].includes(String.fromCharCode(...bytes.slice(0, 6)))
-    ) {
-        return 'image/gif'
-    }
-    if (
-        bytes.length >= 12 &&
-        String.fromCharCode(...bytes.slice(0, 4)) === 'RIFF' &&
-        String.fromCharCode(...bytes.slice(8, 12)) === 'WEBP'
-    ) {
-        return 'image/webp'
-    }
-    return null
-}
-
 async function downloadInteractionImage(
     http: HttpLike,
     value: string,
@@ -153,7 +126,7 @@ async function downloadInteractionImage(
     })
     if (buffer.byteLength === 0) throw new Error('图片内容为空')
     const bytes = new Uint8Array(buffer)
-    const mime = imageMimeType(bytes)
+    const mime = sniffImageMime(bytes)
     if (!mime) throw new Error('图片格式不受支持')
     return { bytes, mime }
 }
@@ -174,6 +147,7 @@ export async function prepareInteractionMedia(
     model: ChatLunaChatModel,
     describe: DescribeResolver | null,
     storage: InteractionStorage | null,
+    video: VideoFrameOptions | null,
     signal?: AbortSignal
 ): Promise<PreparedInteractionMedia> {
     const fileConfig = model.fileHandlingConfig
@@ -187,13 +161,98 @@ export async function prepareInteractionMedia(
     const imageParts: InteractionImagePart[] = []
     const deferred: { id: string; url: string; line: number }[] = []
     let imageCount = 0
+    let videoCount = 0
     let totalBytes = 0
     let storageFallbacks = 0
     const downloadFailedMedia: string[] = []
 
+    const relayImage = async (
+        bytes: Uint8Array,
+        mime: string,
+        filename: string
+    ): Promise<string> => {
+        if (storage === null) return imageDataUrl(bytes, mime)
+        try {
+            const stored = await storage.createTempFile(
+                Buffer.from(bytes),
+                filename,
+                MEDIA_RELAY_EXPIRE_HOURS,
+                mime
+            )
+            return stored.url
+        } catch (error) {
+            if (signal?.aborted) throw error
+            storageFallbacks += 1
+            return imageDataUrl(bytes, mime)
+        }
+    }
+
     for (const [index, media] of mediaItems.entries()) {
         const id = `M${index + 1}`
         const metadata = mediaMetadata(media, id)
+        if (media.kind === 'video') {
+            videoCount += 1
+            if (videoCount > INTERACTION_VIDEO_LIMIT) {
+                lines.push(`${metadata} status=unresolved:video-count-limit`)
+                continue
+            }
+            if (video === null) {
+                lines.push(`${metadata} status=metadata-only`)
+                continue
+            }
+            if (!canAttachAnyImage(model)) {
+                lines.push(
+                    `${metadata} status=unresolved:${imageRejectionReason(model)}`
+                )
+                continue
+            }
+            try {
+                const extracted = await extractVideoFrames(
+                    http,
+                    media.url,
+                    video,
+                    signal
+                )
+                if (!supportsDirectImageMime(model, extracted.mime)) {
+                    lines.push(
+                        `${metadata} actual_mime=${extracted.mime} ` +
+                            'status=unresolved:mime-not-supported-directly'
+                    )
+                    continue
+                }
+                let attached = 0
+                for (const [frameIndex, frame] of extracted.frames.entries()) {
+                    const encodedBytes = base64EncodedSize(frame.byteLength)
+                    if (encodedBytes > maxImageBytes(extracted.mime)) continue
+                    if (totalBytes + encodedBytes > maxTotalBytes) break
+                    totalBytes += encodedBytes
+                    const frameUrl = await relayImage(
+                        frame,
+                        extracted.mime,
+                        `${id}F${frameIndex + 1}.${imageExtension(extracted.mime)}`
+                    )
+                    imageParts.push({
+                        type: 'image_url',
+                        image_url: { url: frameUrl }
+                    })
+                    attached += 1
+                }
+                lines.push(
+                    `${metadata} mode=${video.mode} ` +
+                        `sampled=${extracted.sampledSeconds.join(',')} ` +
+                        `duration_ms=${extracted.durationMs ?? 'unknown'} ` +
+                        `frames=${attached} ` +
+                        `status=${attached > 0 ? 'attached' : 'unresolved:frame-budget'}`
+                )
+            } catch (error) {
+                if (signal?.aborted) throw error
+                downloadFailedMedia.push(id)
+                lines.push(
+                    `${metadata} status=unresolved:video-frames-unavailable`
+                )
+            }
+            continue
+        }
         if (media.kind !== 'image') {
             lines.push(`${metadata} status=metadata-only`)
             continue
@@ -246,25 +305,11 @@ export async function prepareInteractionMedia(
                 continue
             }
             totalBytes += encodedBytes
-            let url: string
-            if (storage !== null) {
-                try {
-                    url = (
-                        await storage.createTempFile(
-                            Buffer.from(downloaded.bytes),
-                            `${id}.${imageExtension(downloaded.mime)}`,
-                            MEDIA_RELAY_EXPIRE_HOURS,
-                            downloaded.mime
-                        )
-                    ).url
-                } catch (error) {
-                    if (signal?.aborted) throw error
-                    storageFallbacks += 1
-                    url = imageDataUrl(downloaded.bytes, downloaded.mime)
-                }
-            } else {
-                url = imageDataUrl(downloaded.bytes, downloaded.mime)
-            }
+            const url = await relayImage(
+                downloaded.bytes,
+                downloaded.mime,
+                `${id}.${imageExtension(downloaded.mime)}`
+            )
             imageParts.push({
                 type: 'image_url',
                 image_url: { url }

@@ -33,7 +33,6 @@ export function applyCommands(
 ): void {
     const command = ctx.command(QZONE_COMMAND_NAME)
         .alias('空间')
-        .before(createAllowGuard(config))
         .action(() => USAGE_LINES.join('\n'))
 
     registerFeeds(command, ctx, () => config.feedsDefaultLimit)
@@ -44,4 +43,8 @@ export function applyCommands(
         publish: () => deps.publish()
     })
     registerDigest(command, deps.digest)
+
+    const guard = createAllowGuard(config)
+    command.before(guard)
+    for (const child of command.children) child.before(guard)
 }

@@ -1,8 +1,8 @@
 import type { Context } from 'koishi'
 import type { ChatLunaChatModel } from '../chatluna'
-import type { Config } from '../config'
+import { type Config, safeTrimmed } from '../config'
 import type { LivingDiaryLogger } from '../logging'
-import { publishQzonePost } from '../publish'
+import { createPublishContext, publishQzonePost } from '../publish/context'
 import { isModelConfigured } from '../persona'
 import {
     buildDigestPrompt,
@@ -136,7 +136,7 @@ export class DigestRuntime {
         const startedAt = this.deps.now()
         this.#report = { ...this.#report, phase: 'running', detail: '正在汇总当日记忆' }
         try {
-            const presetId = this.config.personaPresetId.trim()
+            const presetId = safeTrimmed(this.config.personaPresetId)
             if (presetId.length === 0) {
                 return this.#finish(
                     'suspended',
@@ -145,7 +145,9 @@ export class DigestRuntime {
                 )
             }
             const model = isModelConfigured(this.config.mainModel)
-                ? await this.deps.resolveModel(this.config.mainModel.trim())
+                ? await this.deps.resolveModel(
+                  safeTrimmed(this.config.mainModel)
+              )
                 : null
             if (model === null) {
                 return this.#finish(
@@ -215,7 +217,15 @@ export class DigestRuntime {
                     memory.memories.length
                 )
             }
-            const published = await publishQzonePost(this.ctx, {
+            const target = createPublishContext(this.ctx)
+            if (target === null) {
+                return this.#finish(
+                    'failed',
+                    'QQ 空间服务尚未就绪，无法发布',
+                    startedAt
+                )
+            }
+            const published = await publishQzonePost(target, {
                 content: decision.value.content,
                 imageUrls: [],
                 debug: this.config.debug

@@ -1,8 +1,8 @@
 import type { Context } from 'koishi'
 import { SystemMessage } from '@langchain/core/messages'
-import type { Config } from '../config'
+import { type Config, safeTrimmed } from '../config'
 import type { LivingDiaryLogger } from '../logging'
-import { publishQzonePost } from '../publish'
+import { createPublishContext, publishQzonePost } from '../publish/context'
 import {
     registerGetTempListener,
     subscribeAssistantResponses,
@@ -69,11 +69,11 @@ export interface PublishCapability {
 const readCharacterService = (
     ctx: Context
 ): CharacterServiceLike | null => {
-    const holder = ctx as unknown as Record<string, unknown>
-    const service = holder['chatluna_character']
+    const service = ctx.get('chatluna_character' as never) as
+        | CharacterServiceLike
+        | undefined
     if (service == null) return null
-    const candidate = service as CharacterServiceLike
-    return typeof candidate.getTemp === 'function' ? candidate : null
+    return typeof service.getTemp === 'function' ? service : null
 }
 
 const imageIndex = (key: string): number =>
@@ -94,6 +94,7 @@ export class PublishXmlTool {
     #reason: PublishCapabilityReason = 'disabled'
     #detail = ''
     #pendingFeedback: string[] = []
+    #pendingReason: 'waiting' | 'missing' | null = null
 
     constructor(
         private readonly ctx: Context,
@@ -127,9 +128,11 @@ export class PublishXmlTool {
         if (this.#dispose !== null) return
         const service = readCharacterService(this.ctx)
         if (service === null) {
-            this.#warnMissingCharacter()
+            this.#pendingReason = 'waiting'
+            this.#markPending()
             return
         }
+        this.#pendingReason = null
         const sessions = new WeakMap<object, unknown>()
         const unsubscribes = new WeakMap<object, () => void>()
         this.#sessionDisposes = []
@@ -173,6 +176,26 @@ export class PublishXmlTool {
         this.logger.info('qzone_publish XML 发布能力已挂载（Character 流程）')
     }
 
+    attach(): void {
+        if (this.#dispose !== null) return
+        if (!this.config.enablePublishTool) return
+        this.#pendingReason = null
+        this.start()
+    }
+
+    settle(): void {
+        if (this.#dispose !== null) return
+        if (!this.config.enablePublishTool) return
+        const service = readCharacterService(this.ctx)
+        if (service !== null) {
+            this.attach()
+            return
+        }
+        if (this.#pendingReason === null) return
+        this.#pendingReason = null
+        this.#warnMissingCharacter()
+    }
+
     stop(): void {
         this.#dispose?.()
         this.#dispose = null
@@ -188,6 +211,11 @@ export class PublishXmlTool {
             this.#reason = 'missing-character'
             this.#detail = '已随插件卸载'
         }
+    }
+
+    #markPending(): void {
+        this.#reason = 'missing-character'
+        this.#detail = '等待 chatluna_character 服务加载'
     }
 
     #warnMissingCharacter(): void {
@@ -288,7 +316,18 @@ export class PublishXmlTool {
             .map((key) => attrs[key].trim())
             .filter((url) => url.length > 0)
         try {
-            const result = await publishQzonePost(this.ctx, {
+            const target = createPublishContext(this.ctx)
+            if (target === null) {
+                this.#stats.failed += 1
+                this.#recordFeedback(
+                    '未发布到 QQ 空间：QQ 空间服务尚未就绪'
+                )
+                this.logger.warn(
+                    '[qzone_publish] QQ 空间服务尚未就绪，本次放弃发布'
+                )
+                return
+            }
+            const result = await publishQzonePost(target, {
                 content,
                 imageUrls,
                 debug: this.config.debug
@@ -333,7 +372,7 @@ export class PublishXmlTool {
     }
 
     #injectPrompt(): (() => void) | null {
-        const template = this.config.promptPublishTool.trim()
+        const template = safeTrimmed(this.config.promptPublishTool)
         if (template.length === 0) return null
         const holder = this.ctx as unknown as Record<string, unknown>
         const chatluna = holder['chatluna'] as
@@ -350,14 +389,23 @@ export class PublishXmlTool {
             )
             return null
         }
-        return manager.pipeline(
-            'after_system_prompts',
-            async (runtime, next) => {
-                await this.#pushSystemPrompt(runtime, template)
-                await next()
-            },
-            30
-        )
+        try {
+            return manager.pipeline(
+                'after_system_prompts',
+                async (runtime, next) => {
+                    await this.#pushSystemPrompt(runtime, template)
+                    await next()
+                },
+                30
+            )
+        } catch (error) {
+            this.logger.warn(
+                'qzone_publish 参考提示词自动注入失败，请手动把 ' +
+                    'promptPublishTool 的内容加入预设：' +
+                    errorText(error)
+            )
+            return null
+        }
     }
 
     async #pushSystemPrompt(

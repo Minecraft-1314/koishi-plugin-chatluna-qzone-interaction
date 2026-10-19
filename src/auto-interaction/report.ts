@@ -18,6 +18,8 @@ export interface InteractionRoundStats {
     readonly likeAttempts: number
     readonly likesApplied: number
     readonly likeAlreadyApplied: number
+    readonly retried: number
+    readonly exhausted: number
     readonly errors: number
 }
 
@@ -32,6 +34,16 @@ export type InteractionErrorKind =
     | 'write-auth'
     | 'write'
 
+export interface InteractionRetryView {
+    readonly key: string
+    readonly kind: string
+    readonly postId: string
+    readonly authorId: string
+    readonly attempts: number
+    readonly lastFailure: string | null
+    readonly detectedAt: number
+}
+
 export interface InteractionReport {
     readonly phase: InteractionPhase
     readonly detail: string
@@ -42,6 +54,9 @@ export interface InteractionReport {
     readonly monitorLimit: number
     readonly pendingTriggers: number
     readonly maxWritesPerRound: number
+    readonly retryLimit: number
+    readonly pendingRetries: number
+    readonly retries: readonly InteractionRetryView[]
     readonly round: InteractionRoundStats | null
     readonly lastError: InteractionErrorKind | null
 }
@@ -58,6 +73,8 @@ export function emptyRoundStats(): InteractionRoundStats {
         likeAttempts: 0,
         likesApplied: 0,
         likeAlreadyApplied: 0,
+        retried: 0,
+        exhausted: 0,
         errors: 0
     }
 }

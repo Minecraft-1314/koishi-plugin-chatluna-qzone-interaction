@@ -39,7 +39,7 @@ export interface DigestDecision {
 const section = (value: string, fallback: string): string[] =>
     (value.trim().length > 0 ? value : fallback).split('\n')
 
-const TIME_FORMAT = new Intl.DateTimeFormat('zh-CA', {
+const TIME_FORMAT = new Intl.DateTimeFormat('zh-CN', {
     timeZone: 'Asia/Shanghai',
     hour: '2-digit',
     minute: '2-digit',

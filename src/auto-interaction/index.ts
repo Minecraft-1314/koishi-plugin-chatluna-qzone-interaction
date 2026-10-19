@@ -1,6 +1,6 @@
 import type { Context } from 'koishi'
-import type {} from '../chatluna'
-import type { Config } from '../config'
+import type { ChatLunaStorageLike } from '../chatluna'
+import { type Config, safeTrimmed } from '../config'
 import {
     isModelConfigured,
     renderPresetPersona,
@@ -9,6 +9,7 @@ import {
 import { decideInteractionAction } from './agent'
 import { canDescribeWithTransformer, describeMedia } from './describe-media'
 import { prepareInteractionMedia } from './media'
+import { resolveFfmpegExecutable } from './video-frames'
 import type { InteractionReport } from './report'
 import type { RuntimeReports } from '../status'
 import {
@@ -22,8 +23,19 @@ export * from './runtime'
 export const inject = {
     chatluna: { required: true },
     chatluna_qzone_interaction: { required: true },
+    http: { required: true },
+    ffmpeg: { required: false },
     chatluna_character: { required: false },
-    chatluna_storage: { required: false }
+    chatluna_storage: { required: false },
+    chatluna_memory: { required: false },
+    chatluna_living_memory: { required: false }
+}
+
+const readStorage = (ctx: Context): ChatLunaStorageLike | null => {
+    const storage = ctx.get('chatluna_storage' as never) as
+        | ChatLunaStorageLike
+        | undefined
+    return storage ?? null
 }
 
 export function createAutoInteractionDeps(
@@ -61,7 +73,16 @@ export function createAutoInteractionDeps(
                           return described.map((item) => item.text || null)
                       }
                     : null,
-                ctx.chatluna_storage ?? null,
+                readStorage(ctx),
+                {
+                    executable: resolveFfmpegExecutable(
+                        ctx,
+                        config.ffmpegPath
+                    ),
+                    mode: config.videoFrameMode,
+                    count: config.videoFrameCount,
+                    maxBytes: config.videoMaxMegabytes * 1024 * 1024
+                },
                 signal
             ),
         decide: (deps) => decideInteractionAction({ ctx, ...deps })
@@ -95,6 +116,9 @@ export function apply(
             monitorLimit: config.interactionMonitorPostLimit,
             pendingTriggers: 0,
             maxWritesPerRound: config.interactionMaxWritesPerRound,
+            retryLimit: config.interactionWriteRetryLimit,
+            pendingRetries: 0,
+            retries: [],
             round: null,
             lastError: null
         }
@@ -117,6 +141,9 @@ export function apply(
             monitorLimit: config.interactionMonitorPostLimit,
             pendingTriggers: 0,
             maxWritesPerRound: config.interactionMaxWritesPerRound,
+            retryLimit: config.interactionWriteRetryLimit,
+            pendingRetries: 0,
+            retries: [],
             round: null,
             lastError: null
         }
@@ -129,7 +156,7 @@ export function apply(
         )
         return
     }
-    const presetId = config.personaPresetId.trim()
+    const presetId = safeTrimmed(config.personaPresetId)
     const missing: string[] = []
     if (needsModel) {
         if (!presetId) missing.push('personaPresetId')
@@ -148,6 +175,9 @@ export function apply(
             monitorLimit: config.interactionMonitorPostLimit,
             pendingTriggers: 0,
             maxWritesPerRound: config.interactionMaxWritesPerRound,
+            retryLimit: config.interactionWriteRetryLimit,
+            pendingRetries: 0,
+            retries: [],
             round: null,
             lastError: null
         }
@@ -165,6 +195,8 @@ export function apply(
         interactionWhitelist,
         monitorLimit: config.interactionMonitorPostLimit,
         maxWritesPerRound: config.interactionMaxWritesPerRound,
+        writeRetryLimit: config.interactionWriteRetryLimit,
+        baselineGraceMinutes: config.friendFeedBaselineGraceMinutes,
         modelRef: config.subModel,
         presetId,
         assistantLabel: resolveAssistantLabel(presetId),
@@ -175,6 +207,7 @@ export function apply(
         promptSystem: config.promptSystemInteraction
     })
     const releaseReport = reports.interaction.bind(() => runtime.report)
+    const releaseRuntime = reports.interactionRuntime.bind(() => runtime)
     let inFlight: Promise<void> | null = null
     let started = false
     const run = () => {
@@ -211,5 +244,6 @@ export function apply(
         await inFlight?.catch(() => {})
         runtime.stop()
         releaseReport()
+        releaseRuntime()
     })
 }

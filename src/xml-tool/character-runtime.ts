@@ -174,24 +174,6 @@ const notifyOne = (
 const isTrackable = (item: unknown): item is object =>
     typeof item === 'object' && item !== null
 
-const replayExistingMessages = (
-    messages: unknown[],
-    subscription: PushSubscription,
-    dispatcherSeen: WeakSet<object>,
-    getSession: () => unknown,
-    onListenerError?: (error: unknown) => void
-): void => {
-    for (const item of messages) {
-        if (!isAiMessage(item)) continue
-        if (isTrackable(item)) {
-            if (subscription.delivered.has(item)) continue
-            subscription.delivered.add(item)
-            dispatcherSeen.add(item)
-        }
-        notifyOne(subscription, item as MessageLike, getSession, onListenerError)
-    }
-}
-
 export function subscribeAssistantResponses(
     messages: unknown[],
     getSession: () => unknown,
@@ -247,13 +229,6 @@ export function subscribeAssistantResponses(
         delivered: new WeakSet<object>()
     }
     dispatcher.subscriptions.add(subscription)
-    replayExistingMessages(
-        messages,
-        subscription,
-        dispatcher.seen,
-        getSession,
-        onListenerError
-    )
     return () => {
         const current = getDispatcher(messages)
         if (current === null) return

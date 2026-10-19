@@ -27,6 +27,8 @@ export interface PendingTrigger {
     readonly commentKey: string | null
     readonly occurredAt: number | null
     readonly detectedAt: number
+    attempts: number
+    lastFailure: string | null
 }
 
 export interface TriggerTerminalRecord {
@@ -48,10 +50,6 @@ export interface MonitoredPost {
 
 export interface FriendFeedWatermark {
     readonly timestamp: number
-    /**
-     * 水位线附近已见过的动态，key 为 postKey，值为发布时间戳。
-     * 包含时间戳恰好等于水位线的动态，因此水位线前移时无需额外保留同刻集合。
-     */
     readonly recentKeys: ReadonlyMap<string, number>
 }
 
@@ -217,7 +215,9 @@ export function discoverCommentTriggers(
             actorId: comment.author.id,
             commentKey: nodeKey,
             occurredAt,
-            detectedAt: options.detectedAt
+            detectedAt: options.detectedAt,
+            attempts: 0,
+            lastFailure: null
         })
     }
     monitored.baselineObservationPending = false
@@ -235,7 +235,9 @@ export function createFriendPostTrigger(
         actorId: post.author.id,
         commentKey: null,
         occurredAt: timestampOf(post.createdAt),
-        detectedAt
+        detectedAt,
+        attempts: 0,
+        lastFailure: null
     }
 }
 
@@ -267,6 +269,82 @@ export interface TerminalPruneResult {
     readonly expired: number
     readonly overflow: number
     readonly remaining: number
+}
+
+export function recordPendingFailure(
+    state: InteractionRuntimeState,
+    key: string,
+    reason: string
+): number {
+    const trigger = state.pendingTriggers.get(key)
+    if (trigger === undefined) return 0
+    trigger.attempts += 1
+    trigger.lastFailure = reason
+    return trigger.attempts
+}
+
+export function countPendingRetries(
+    state: InteractionRuntimeState
+): number {
+    let total = 0
+    for (const trigger of state.pendingTriggers.values()) {
+        if (trigger.attempts > 0) total += 1
+    }
+    return total
+}
+
+export function collectRetryViews(
+    state: InteractionRuntimeState
+): {
+    key: string
+    kind: string
+    postId: string
+    authorId: string
+    attempts: number
+    lastFailure: string | null
+    detectedAt: number
+}[] {
+    const views = [] as {
+        key: string
+        kind: string
+        postId: string
+        authorId: string
+        attempts: number
+        lastFailure: string | null
+        detectedAt: number
+    }[]
+    for (const trigger of sortPendingTriggers(
+        state.pendingTriggers.values()
+    )) {
+        if (trigger.attempts <= 0) continue
+        views.push({
+            key: trigger.key,
+            kind: trigger.kind,
+            postId: trigger.post.id,
+            authorId: trigger.post.authorId,
+            attempts: trigger.attempts,
+            lastFailure: trigger.lastFailure,
+            detectedAt: trigger.detectedAt
+        })
+    }
+    return views
+}
+
+export function createBaselineWatermark(
+    posts: readonly QzonePost[],
+    cutoff: number,
+    graceMs: number = FRIEND_FEED_GRACE_MS
+): FriendFeedWatermark {
+    const floor = graceFloor(cutoff, graceMs)
+    const recentKeys = new Map<string, number>()
+    for (const post of posts) {
+        const at = timestampOf(post.createdAt)
+        if (at === null) continue
+        if (at >= cutoff) continue
+        if (at < floor) continue
+        recentKeys.set(postKey(post), at)
+    }
+    return { timestamp: cutoff, recentKeys }
 }
 
 export function pruneTerminalTriggers(

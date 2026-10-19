@@ -3,6 +3,7 @@ import type { Context } from 'koishi'
 import type { Config } from './config'
 import * as autoInteractionEntry from './auto-interaction'
 import { applyCommands } from './commands'
+import { setupConsole } from './console'
 import { DigestRuntime } from './digest/runtime'
 import { renderPresetPersona } from './persona'
 import * as personaEntry from './persona'
@@ -14,11 +15,12 @@ export const name = 'chatluna-qzone-interaction'
 
 export const inject = {
     chatluna: { required: true },
+    http: { required: true },
+    ffmpeg: { required: false },
     chatluna_character: { required: false },
     chatluna_memory: { required: false },
     chatluna_living_memory: { required: false },
-    chatluna_storage: { required: false },
-    chatluna_qzone_interaction: { required: false }
+    chatluna_storage: { required: false }
 }
 
 export function apply(ctx: Context, config: Config) {
@@ -43,11 +45,32 @@ export function apply(ctx: Context, config: Config) {
         apply: (ctx: Context) =>
             autoInteractionEntry.apply(ctx, config, reports)
     })
-    ctx.inject(['chatluna_character'], () => {
-        publishTool.start()
-    })
+    const consoleService = ctx.get('console' as never)
+    if (consoleService) {
+        try {
+            setupConsole(
+                consoleService,
+                ctx,
+                config,
+                reports,
+                () => digestRef,
+                () => publishTool.capability
+            )
+        } catch (error) {
+            ctx.logger.warn(
+                'QQ 空间互动：控制台页面注册失败，其余功能不受影响：' +
+                    (error instanceof Error
+                        ? error.message
+                        : String(error))
+            )
+        }
+    }
     publishTool.start()
+    ctx.inject(['chatluna_character'], () => {
+        publishTool.attach()
+    })
     ctx.on('ready', () => {
+        publishTool.settle()
         digest.start()
     })
     ctx.on('dispose', () => {

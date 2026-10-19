@@ -12,7 +12,13 @@ import {
 } from './prompt-defaults'
 
 export type InteractionMode = 'off' | 'forced' | 'decide'
+
+export const safeText = (value: unknown): string =>
+    typeof value === 'string' ? value : ''
+
+export const safeTrimmed = (value: unknown): string => safeText(value).trim()
 export type CookiePlatformMode = CookiePlatform | 'auto'
+export type VideoFrameMode = 'first' | 'average'
 
 export interface Config {
     selfId?: string
@@ -37,6 +43,12 @@ export interface Config {
     interactionMonitorPostLimit: number
     interactionPollIntervalMinutes: number
     interactionMaxWritesPerRound: number
+    interactionWriteRetryLimit: number
+    friendFeedBaselineGraceMinutes: number
+    videoFrameMode: VideoFrameMode
+    videoFrameCount: number
+    videoMaxMegabytes: number
+    ffmpegPath: string
     promptTask: string
     promptMedia: string
     promptWriting: string
@@ -166,8 +178,54 @@ export const Config: Schema<Config> = Schema.intersect([
             .description('每轮最多发起的写请求数（评论、回复、点赞共用）')
             .min(1)
             .max(20)
-            .default(5)
+            .default(5),
+        interactionWriteRetryLimit: Schema.natural()
+            .description(
+                '单条互动失败后的重试次数（正整数，0 表示失败即放弃）。' +
+                    '失败原因会被记录，等待下一轮轮询重试'
+            )
+            .min(0)
+            .max(10)
+            .default(2),
+        friendFeedBaselineGraceMinutes: Schema.natural()
+            .description(
+                '启动时回溯处理多少分钟内的好友动态（正整数）。' +
+                    '默认 10 表示机器人启动前 10 分钟内发布的动态也会被评论'
+            )
+            .min(1)
+            .max(1440)
+            .default(10)
     }).description('评论互动设置'),
+    Schema.object({
+        videoFrameMode: Schema.union([
+            Schema.const('first').description('只抽取第一帧'),
+            Schema.const('average').description('按等分点抽取平均帧')
+        ])
+            .description(
+                '遇到视频时抽取画面的方式。平均帧会把整段视频等分成若干份，' +
+                    '在每个等分点各取一帧'
+            )
+            .default('first'),
+        videoFrameCount: Schema.natural()
+            .description(
+                '平均帧模式下的等分份数（正整数）。视频按每秒一帧计算，' +
+                    '实际抽取数不会超过视频总秒数'
+            )
+            .min(1)
+            .max(16)
+            .default(3),
+        videoMaxMegabytes: Schema.natural()
+            .description('单个视频允许下载的最大体积（MB）')
+            .min(1)
+            .max(512)
+            .default(64),
+        ffmpegPath: Schema.string()
+            .description(
+                'ffmpeg 可执行文件路径。留空时优先使用 ffmpeg 服务，' +
+                    '其次回退到系统 PATH 中的 ffmpeg'
+            )
+            .default('')
+    }).description('视频处理设置'),
     Schema.object({
         promptSystemInteraction: Schema.string()
             .description(

@@ -56,6 +56,8 @@ export interface AutoInteractionOptions {
     readonly interactionWhitelist: InteractionWhitelist
     readonly monitorLimit: number
     readonly maxWritesPerRound: number
+    readonly writeRetryLimit: number
+    readonly baselineGraceMinutes: number
     readonly modelRef: string
     readonly presetId: string
     readonly assistantLabel: string

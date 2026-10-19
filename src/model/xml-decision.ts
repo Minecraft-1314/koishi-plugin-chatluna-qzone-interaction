@@ -1,21 +1,8 @@
 import { parseLikeFlag } from '../auto-interaction/decision'
 import type { InteractionMode } from '../config'
+import { decodeXmlEntities } from './prompt-format'
 
 const DECISION_BLOCK_TAG = 'qzone_decision'
-
-const decodeXmlEntities = (value: string): string =>
-    value
-        .replace(/&lt;/gu, '<')
-        .replace(/&gt;/gu, '>')
-        .replace(/&quot;/gu, '"')
-        .replace(/&apos;/gu, "'")
-        .replace(/&#x([0-9a-f]+);/giu, (_, hex: string) =>
-            String.fromCodePoint(Number.parseInt(hex, 16))
-        )
-        .replace(/&#(\d+);/gu, (_, code: string) =>
-            String.fromCodePoint(Number(code))
-        )
-        .replace(/&amp;/gu, '&')
 
 const findClosingTagIndex = (
     text: string,

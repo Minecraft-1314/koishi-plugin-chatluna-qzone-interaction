@@ -43,15 +43,15 @@ export function registerFeeds(
     defaultLimit: () => number
 ): void {
     command
-        .subcommand('.feeds [count:text]')
-        .option('-t, --target <qq>', '读取指定 QQ 的公开动态')
+        .subcommand('.feeds [count]')
+        .option('target', '-t <qq> 读取指定 QQ 的公开动态')
         .usage('读取 QQ 空间动态')
         .example('qzone.feeds           # 读取自己的动态')
         .example('qzone.feeds 3         # 读取自己的最近 3 条')
         .example('qzone.feeds -t 123456 # 读取该 QQ 的公开动态')
-        .action(async (_argv, count, target) => {
+        .action(async (argv, count) => {
             const limit = clampCount(count, defaultLimit())
-            const userId = typeof target === 'string' ? target.trim() : ''
+            const userId = normalizeUserId(argv.options?.target)
             const label = userId.length > 0 ? `QQ ${userId}` : '自己'
             let page: FeedPage
             try {
@@ -79,8 +79,11 @@ export function registerFeeds(
         })
 }
 
+const normalizeUserId = (value: unknown): string =>
+    typeof value === 'string' ? value.trim() : ''
+
 const clampCount = (value: unknown, fallback: number): number => {
     const parsed = Number.parseInt(String(value ?? ''), 10)
     if (!Number.isFinite(parsed) || parsed <= 0) return fallback
-    return Math.min(parsed, 10)
+    return Math.min(parsed, 20)
 }

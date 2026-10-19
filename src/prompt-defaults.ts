@@ -35,6 +35,7 @@ export const DEFAULT_PROMPT_PUBLISH_TOOL = [
     '<qzone_publish content="要发布的正文" />',
     '需要附带图片时按顺序追加 image1、image2 等属性，值为图片的 http/https 地址：',
     '<qzone_publish content="要发布的正文" image1="https://..." />',
+    '一条动态最多附带 9 张图片，超出时整条不会发布；视频与其它文件无法发布。',
     '同一轮最多输出一个该标签；不需要发布时不要输出这个标签。'
 ].join('\n')
 

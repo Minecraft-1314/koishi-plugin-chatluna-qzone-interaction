@@ -1,16 +1,22 @@
 {
   "name": "koishi-plugin-chatluna-qzone-interaction",
   "description": "koishi-plugin-chatluna-livingdiary 的分支（fork），全部走纯 XML 文本契约，完全不使用模型工具调用能力",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
-  "files": ["lib", "docs"],
+  "files": [
+    "lib",
+    "dist",
+    "docs"
+  ],
   "license": "MIT",
   "scripts": {
-    "build": "tsc",
+    "build": "npm run build:backend && npm run build:client",
+    "build:backend": "tsc",
+    "build:client": "vite build",
     "dev": "tsc -w",
-    "clean": "rimraf lib",
-    "test": "node test/units.js && node test/runtime.js && node test/commands.js"
+    "dev:client": "vite build --watch",
+    "clean": "rimraf lib dist"
   },
   "keywords": [
     "chatbot",
@@ -50,19 +56,20 @@
     "调试模式"
   ],
   "dependencies": {
-    "@langchain/core": "^0.3.80",
+    "@langchain/core": ">=0.3.80",
     "@vue/reactivity": "^3.6.0-alpha.2",
     "qzone-sdk": "^0.3.3",
     "zod": "3.25.76"
   },
   "devDependencies": {
+    "@koishijs/client": "^5.30.11",
+    "@koishijs/console": "^5.30.11",
     "@types/node": "^20.19.0",
-    "koishi": "^4.18.9",
-    "koishi-plugin-adapter-onebot": "6.9.4",
-    "koishi-plugin-chatluna": "^1.4.0-alpha.37",
-    "koishi-plugin-chatluna-storage-service": "^1.0.7",
+    "@vitejs/plugin-vue": "^5.2.1",
     "rimraf": "^5.0.5",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vite": "^5.4.21",
+    "vue": "^3.5.13"
   },
   "peerDependencies": {
     "koishi": "^4.18.9",
@@ -97,9 +104,11 @@
     },
     "service": {
       "required": [
-        "chatluna"
+        "chatluna",
+        "http"
       ],
       "optional": [
+        "ffmpeg",
         "chatluna_character",
         "chatluna_memory",
         "chatluna_living_memory",
